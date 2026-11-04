@@ -17,7 +17,7 @@ source/build provenance before requests are enabled.
 ## Roles and source controls
 
 Taylor Emery (`emerytech`) is the maintainer and proposed signing approver.
-The proposed human reviewer is `ets3d` (the maintainer's wife). Collaborator invitations have been issued; acceptance and her own MFA verification remain pending. Automation/LLMs do
+The proposed human reviewer is `ets3d` (the maintainer's wife). Repository write access for `ets3d` has been accepted and verified. Her own MFA verification and actual approving review remain required. Automation/LLMs do
 not count as human approval. Signing stays disabled until roles are accepted.
 Changes to release source, build scripts, policies and trusted update keys must
 use a pull request with passing Windows tests and human review. Protected main
