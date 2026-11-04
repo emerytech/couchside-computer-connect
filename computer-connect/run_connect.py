@@ -1,0 +1,3 @@
+from computer_connect.ui import main
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,7720 @@
+#!/usr/bin/env python3
+"""couchsided-win.py: Windows box-side agent for Couchside.
+
+Python3 stdlib (ctypes for Win32), plus PyCA for HTTPS certificate creation.
+Serves the same Couchside agent API
+contract v1 as the Linux agent (agent/couchsided.py) on port 8787, so the
+phone app pairs and talks to a Windows HTPC exactly like a SteamOS/Bazzite
+box. Also runs on macOS/Linux in --mock mode for phone-app development.
+
+Windows equivalents of the Linux primitives:
+  status    GetTickCount64 / GlobalMemoryStatusEx / GetSystemTimes /
+            GetDriveTypeW + shutil.disk_usage / GetAdaptersInfo
+  units     Windows services via `sc query` / `sc qdescription`
+  journal   Windows Event Log via `wevtutil qe` (provider = unit name)
+  actions   shutdown.exe / rundll32 (an interactive user can shut down,
+            reboot, suspend, and lock without elevation)
+  gamepad   ViGEmBus kernel driver via ViGEmClient.dll (ctypes); mouse,
+            keyboard and volume keys via SendInput (no driver needed)
+  panel     RS-232 over COMn via CreateFileW/SetCommState (same Newline
+            TruTouch frames as the Linux agent)
+
+Watched units and recovery actions are config-driven:
+%ProgramData%\\Couchside\\config.json (overridable with --config). On a
+missing or invalid config the agent logs a warning and falls back to safe
+generic defaults.
+
+IMPORTANT deployment note: virtual input (SendInput, ViGEm) only works from
+the interactive user session, NOT from a session-0 Windows service. Install
+as a logon-triggered Scheduled Task running as the (non-elevated) desktop
+user (install.ps1 does this), never as a classic service. Keeping the agent
+unprivileged mirrors the Linux agent's least-privilege model: the bearer-
+authed action/launcher API must never hand LAN clients admin execution.
+"""
+
+import argparse
+from functools import wraps
+from pathlib import Path
+import base64
+import ctypes
+import glob
+import hashlib
+import hmac
+import ipaddress
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import ssl
+import tempfile
+import secrets
+import datetime
+import csv
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs, unquote, quote
+
+IS_WINDOWS = sys.platform == "win32"
+
+if IS_WINDOWS:
+    import winreg
+    from ctypes import wintypes
+    # use_last_error=True so error paths can read ctypes.get_last_error()
+    # (the value captured at FFI return) instead of the live thread
+    # LastError, which interpreter housekeeping can overwrite.
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+    _ws2_32 = ctypes.WinDLL("ws2_32", use_last_error=True)
+else:  # --mock on macOS/Linux: never touch Win32
+    winreg = None
+    wintypes = None
+    _kernel32 = _user32 = _iphlpapi = _ws2_32 = None
+
+# The QR encoder (same pure-stdlib module the Linux agent uses); /pair renders
+# the matrix server-side from it. When installed, install.ps1 copies qr.py in
+# beside this file; when run from a repo checkout it lives one dir up in
+# agent/. Put both on the path so either layout resolves `import qr`.
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)
+sys.path.insert(1, os.path.dirname(_here))
+try:
+    import qr as qrmod
+except ImportError:
+    qrmod = None
+
+# Same app id the phone expects (AGENT_APPS in app/lib/api.ts); the Windows
+# agent versions independently of the Linux one.
+APP_NAME = "couchside-agent"
+VERSION = "0.4.15-rc1-win"
+
+_PROGRAMDATA = os.environ.get("ProgramData", r"C:\ProgramData")
+DEFAULT_CONFIG_PATH = os.path.join(_PROGRAMDATA, "Couchside", "config.json")
+DEFAULT_TOKEN_PATH = os.path.join(_PROGRAMDATA, "Couchside", "token")
+
+# --- agent log file ----------------------------------------------------------
+# The agent is launched by a scheduled task running pythonw.exe, which is
+# GUI-subsystem and has NO console: every print() in this file goes to a handle
+# that discards it. /api/journal only reads the Windows Event Log for watched
+# SERVICES, and the agent is not a service -- so the agent's own diagnostics
+# were unrecoverable on Windows. That is not a cosmetic gap: the one line that
+# explains a stuck input session ("[gamepad] ... input blocked") could not be
+# read back from a user's machine at all.
+#
+# So tee stdout/stderr into a rotating file the app can fetch. Size-capped and
+# rotated once, because this runs forever on someone else's PC and must not
+# grow without bound.
+AGENT_LOG_PATH = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.join(_PROGRAMDATA, "Couchside"),
+    "Couchside", "logs", "agent.log")
+AGENT_LOG_MAX_BYTES = 1 << 20      # 1 MiB, then rotate to .1 (2 MiB on disk max)
+
+
+class _Tee:
+    """Write-through to the original stream AND the log file.
+
+    Keeps the original stream so a console run (python.exe, or --mock in a
+    terminal) still prints normally. Never raises: a logging failure must not
+    take down an input path, so every write is best-effort."""
+
+    def __init__(self, stream, path):
+        self._s = stream
+        self._path = path
+        self._lock = threading.Lock()
+
+    def write(self, text):
+        try:
+            if self._s is not None:
+                self._s.write(text)
+        except Exception:
+            pass
+        try:
+            with self._lock:
+                self._rotate_if_needed()
+                with open(self._path, "a", encoding="utf-8", errors="replace") as f:
+                    f.write(text)
+        except Exception:
+            pass
+        return len(text)
+
+    def flush(self):
+        try:
+            if self._s is not None:
+                self._s.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return bool(self._s and self._s.isatty())
+        except Exception:
+            return False
+
+    def _rotate_if_needed(self):
+        try:
+            if os.path.getsize(self._path) < AGENT_LOG_MAX_BYTES:
+                return
+        except OSError:
+            return
+        try:
+            os.replace(self._path, self._path + ".1")
+        except OSError:
+            pass
+
+
+def start_agent_log():
+    """Tee stdout/stderr to AGENT_LOG_PATH. Best-effort; returns the path or
+    None. Called first thing in main() so even startup failures are captured."""
+    try:
+        os.makedirs(os.path.dirname(AGENT_LOG_PATH), exist_ok=True)
+        sys.stdout = _Tee(sys.stdout, AGENT_LOG_PATH)
+        sys.stderr = _Tee(sys.stderr, AGENT_LOG_PATH)
+        return AGENT_LOG_PATH
+    except Exception:
+        return None
+
+DEFAULT_PORT = 8787
+
+# Flags for spawning children without popping console windows, and for
+# fire-and-forget detach (reboot etc. must outlive the agent).
+if IS_WINDOWS:
+    CREATE_NO_WINDOW = 0x08000000
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    _RUN_FLAGS = CREATE_NO_WINDOW
+    _DETACH_FLAGS = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+else:
+    _RUN_FLAGS = 0
+    _DETACH_FLAGS = 0
+
+# ---------------------------------------------------------------------------
+# Config: watched units + recovery actions
+#
+# Same schema as the Linux agent's /etc/couchside/config.json, with two
+# Windows-specific readings:
+#   - units[].name is a Windows SERVICE name (e.g. "Audiosrv"); scope is
+#     accepted for schema parity but both values query the same service
+#     controller (Windows has no systemd --user analog here).
+#   - panel.device is a COM port name ("COM3"), not a /dev path.
+#
+# {
+#   "port": 8787,                                   # optional
+#   "units": [{"name": "Audiosrv", "scope": "system"}, ...],
+#   "actions": {
+#     "<id>": {
+#       "label": "...",                             # optional, defaults to id
+#       "description": "...",                       # optional, defaults to ""
+#       "danger": "low"|"medium"|"high",            # required
+#       "cmd": ["argv0", "arg1", ...],              # required, non-empty
+#       "user_env": bool,                           # accepted, ignored on Windows
+#       "detached": bool                            # optional, default false
+#     }, ...
+#   },
+#   "action_order": ["<id>", ...],                  # optional listing order
+#   "launchers": [                                  # optional custom launchers
+#     {"id": "custom:<slug>", "label": "...", "cmd": [...]}
+#   ],
+#   "panel": {"device": "COM3", "baud": 19200, "protocol": "newline"}
+# }
+# ---------------------------------------------------------------------------
+
+DEFAULT_UNITS = [
+    # (service name, scope). Audiosrv = Windows Audio: the service an HTPC
+    # actually cares about; add Steam/Sunshine etc. via config.json.
+    ("Audiosrv", "system"),
+    # The agent's OWN log, served from the tee'd file rather than the Event Log
+    # (the agent is not a service, so it has no Event Log provider). Listed here
+    # so it passes the WATCHLIST_NAMES allowlist in the journal route and shows
+    # up in the app's Logs picker with no app-side change.
+    ("couchside-agent", "user"),
+]
+
+DEFAULT_ACTIONS = {
+    "restart-explorer": {
+        "label": "Restart Explorer",
+        "description": "Restart the Windows shell (explorer.exe), fixes a wedged desktop/taskbar",
+        "danger": "medium",
+        "cmd": ["powershell", "-NoProfile", "-Command",
+                "Stop-Process -Name explorer -Force; Start-Process explorer.exe"],
+        "user_env": False,
+        "detached": False,
+    },
+    "lock": {
+        "label": "Lock Screen",
+        "description": "Lock the Windows session",
+        "danger": "low",
+        "cmd": ["rundll32.exe", "user32.dll,LockWorkStation"],
+        "user_env": False,
+        "detached": False,
+    },
+    "suspend": {
+        "label": "Suspend",
+        "description": "Suspend the box to RAM; wake it from the app over Wake-on-LAN",
+        "danger": "medium",
+        # SetSuspendState hibernates instead of sleeping when hibernation is
+        # enabled; install.ps1 runs `powercfg /hibernate off` to make this a
+        # true suspend (documented in the README).
+        "cmd": ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+        "user_env": False,
+        "detached": True,
+    },
+    "reboot": {
+        "label": "Reboot",
+        "description": "Reboot the box",
+        "danger": "high",
+        "cmd": ["shutdown", "/r", "/t", "0"],
+        "user_env": False,
+        "detached": True,
+    },
+    "poweroff": {
+        "label": "Power Off",
+        "description": "Power off the box",
+        "danger": "high",
+        "cmd": ["shutdown", "/s", "/t", "0"],
+        "user_env": False,
+        "detached": True,
+    },
+}
+
+DEFAULT_ACTION_ORDER = ["restart-explorer", "lock", "suspend", "reboot", "poweroff"]
+
+# Custom launcher limits (same as the Linux agent).
+MAX_LAUNCHERS = 100
+MAX_CMD_ARGS = 64
+MAX_CMD_ARG_LEN = 4096
+MAX_LABEL_LEN = 200
+
+# Supported serial line speeds (validated in config; the DCB is built from the
+# integer directly on Windows, no termios constants needed).
+PANEL_BAUDS = (9600, 19200, 38400, 57600, 115200)
+
+# Effective config: set by load_config() before the server starts.
+WATCHLIST = list(DEFAULT_UNITS)
+WATCHLIST_NAMES = {name for name, _scope in WATCHLIST}
+ACTIONS = dict(DEFAULT_ACTIONS)
+ACTION_ORDER = list(DEFAULT_ACTION_ORDER)
+CONFIG_PORT = None
+CONFIG_PANEL = None
+CONFIG_CEC_BRIDGE = None  # optional {"host","port","token"}: forward TV ops to a Pi
+CONFIG_ROKU = None  # optional {"host","name"}: Roku (ECP) TV, no pairing needed
+# When true, the app may trigger a box-side agent update via POST
+# /api/update/apply. OFF BY DEFAULT: opt-in only on the box (config.json
+# "allow_app_update": true), never by the app itself. Even when on, the route
+# can only install the newest PUBLISHED emerytech/couchside-windows release's
+# CouchsideSetup.exe after its SHA256 and its SignPath Foundation Authenticode
+# signature both verify; it takes no URL, path or arguments from the request,
+# never downgrades, and is refused outright by unsigned/RC/Python builds.
+ALLOW_APP_UPDATE = False
+# When true, the box may query GitHub (github.com release asset + api.github.com)
+# for a newer agent release when the app calls /api/update/check. OFF BY
+# DEFAULT: opt-in via config.json "allow_update_check" (Setup wizard checkbox,
+# default unticked, or install.ps1 -EnableUpdateCheck). When off the agent makes
+# no update-check network requests and the route reports "disabled": true.
+ALLOW_UPDATE_CHECK = False
+# When true, the app may CREATE custom launchers over the network. OFF BY DEFAULT:
+# a launcher argv is run verbatim as the desktop user (real_launch -> Popen), so
+# remote creation is arbitrary user-level command exec for any bearer-token holder.
+# Opt-in only on the box (`couchside allow-launchers on` / config.json). Triggering
+# owner-defined launchers stays allowed; only remote CREATE is gated. See the Linux
+# agent for the full rationale.
+ALLOW_APP_LAUNCHERS = False
+LAUNCHERS = []
+CONFIG_PATH = DEFAULT_CONFIG_PATH
+CONFIG_LOCK = threading.Lock()
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def _valid_launcher_id(lid):
+    """A stored custom launcher id: "custom:" + a filesystem-safe slug."""
+    if not isinstance(lid, str) or not lid.startswith("custom:"):
+        return False
+    slug = lid[len("custom:"):]
+    if not slug or slug in (".", ".."):
+        return False
+    return all(c.isalnum() or c in "-_" for c in slug)
+
+
+def _valid_cmd(cmd):
+    """A launcher/action argv: non-empty list of non-empty bounded strings."""
+    if not isinstance(cmd, list) or not cmd or len(cmd) > MAX_CMD_ARGS:
+        return False
+    return all(isinstance(a, str) and a and len(a) <= MAX_CMD_ARG_LEN
+               for a in cmd)
+
+
+def _valid_com_device(device):
+    """Panel device must be a plain COM port name ("COM1".."COM255"). The
+    string is opened raw and written command frames, so it must never be
+    attacker-influenced or an arbitrary path."""
+    if not isinstance(device, str) or not device.upper().startswith("COM"):
+        return False
+    digits = device[3:]
+    return digits.isdigit() and 1 <= int(digits) <= 255
+
+
+def _parse_config(raw):
+    """Validate a parsed config.json dict.
+
+    Returns (units, actions, order, port, launchers, panel). Raises
+    ConfigError on any schema violation; the caller falls back to the
+    generic defaults wholesale (no partial merges).
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError("config root must be a JSON object")
+
+    port = raw.get("port")
+    if port is not None:
+        if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+            raise ConfigError("port must be an integer 1-65535")
+
+    units_raw = raw.get("units")
+    if not isinstance(units_raw, list) or not units_raw:
+        raise ConfigError("units must be a non-empty list")
+    units = []
+    seen = set()
+    for i, u in enumerate(units_raw):
+        if not isinstance(u, dict):
+            raise ConfigError("units[%d] must be an object" % i)
+        name = u.get("name")
+        scope = u.get("scope")
+        if not isinstance(name, str) or not name:
+            raise ConfigError("units[%d].name must be a non-empty string" % i)
+        if scope not in ("system", "user"):
+            raise ConfigError("units[%d].scope must be \"system\" or \"user\"" % i)
+        if name in seen:
+            raise ConfigError("duplicate unit %r" % name)
+        seen.add(name)
+        units.append((name, scope))
+
+    actions_raw = raw.get("actions")
+    if not isinstance(actions_raw, dict):
+        raise ConfigError("actions must be an object")
+    actions = {}
+    for aid, spec in actions_raw.items():
+        if not isinstance(aid, str) or not aid:
+            raise ConfigError("action ids must be non-empty strings")
+        if not isinstance(spec, dict):
+            raise ConfigError("actions[%r] must be an object" % aid)
+        danger = spec.get("danger")
+        if danger not in ("low", "medium", "high"):
+            raise ConfigError("actions[%r].danger must be low|medium|high" % aid)
+        cmd = spec.get("cmd")
+        if (not isinstance(cmd, list) or not cmd or
+                not all(isinstance(a, str) and a for a in cmd)):
+            raise ConfigError("actions[%r].cmd must be a non-empty list of strings" % aid)
+        label = spec.get("label", aid)
+        description = spec.get("description", "")
+        if not isinstance(label, str) or not isinstance(description, str):
+            raise ConfigError("actions[%r] label/description must be strings" % aid)
+        user_env = spec.get("user_env", False)
+        detached = spec.get("detached", False)
+        if not isinstance(user_env, bool) or not isinstance(detached, bool):
+            raise ConfigError("actions[%r] user_env/detached must be booleans" % aid)
+        actions[aid] = {
+            "label": label,
+            "description": description,
+            "danger": danger,
+            "cmd": list(cmd),
+            "user_env": user_env,
+            "detached": detached,
+        }
+
+    order_raw = raw.get("action_order")
+    if order_raw is None:
+        order = list(actions.keys())
+    else:
+        if (not isinstance(order_raw, list) or
+                not all(isinstance(a, str) for a in order_raw)):
+            raise ConfigError("action_order must be a list of strings")
+        unknown = [a for a in order_raw if a not in actions]
+        if unknown:
+            raise ConfigError("action_order references unknown actions: %s"
+                              % ", ".join(unknown))
+        if len(set(order_raw)) != len(order_raw):
+            raise ConfigError("action_order has duplicates")
+        order = list(order_raw)
+        order += [a for a in actions if a not in order]  # unlisted go last
+
+    launchers_raw = raw.get("launchers")
+    launchers = []
+    if launchers_raw is not None:
+        if not isinstance(launchers_raw, list):
+            raise ConfigError("launchers must be a list")
+        if len(launchers_raw) > MAX_LAUNCHERS:
+            raise ConfigError("too many launchers (max %d)" % MAX_LAUNCHERS)
+        seen_ids = set()
+        for i, l in enumerate(launchers_raw):
+            if not isinstance(l, dict):
+                raise ConfigError("launchers[%d] must be an object" % i)
+            lid = l.get("id")
+            if not _valid_launcher_id(lid):
+                raise ConfigError("launchers[%d].id must be a valid custom: id" % i)
+            if lid in seen_ids:
+                raise ConfigError("duplicate launcher id %r" % lid)
+            seen_ids.add(lid)
+            label = l.get("label")
+            if not isinstance(label, str) or not label or len(label) > MAX_LABEL_LEN:
+                raise ConfigError("launchers[%d].label must be a non-empty string" % i)
+            cmd = l.get("cmd")
+            if not _valid_cmd(cmd):
+                raise ConfigError("launchers[%d].cmd must be a non-empty argv list" % i)
+            launchers.append({"id": lid, "label": label, "cmd": list(cmd)})
+
+    panel = None
+    panel_raw = raw.get("panel")
+    if panel_raw is not None:
+        if not isinstance(panel_raw, dict):
+            raise ConfigError("panel must be an object")
+        device = panel_raw.get("device")
+        if not _valid_com_device(device):
+            raise ConfigError("panel.device must be a COM port name like \"COM3\"")
+        baud = panel_raw.get("baud", 19200)
+        if baud not in PANEL_BAUDS:
+            raise ConfigError("panel.baud must be one of %s"
+                              % ", ".join(str(b) for b in PANEL_BAUDS))
+        proto = panel_raw.get("protocol", "newline")
+        if proto != "newline":
+            raise ConfigError("panel.protocol must be \"newline\"")
+        panel = {"device": device.upper(), "baud": int(baud), "protocol": proto}
+
+    # Optional CEC bridge: forward TV power/volume to a Raspberry Pi (or any
+    # Linux box) wired to the TV's HDMI running couchside-cec-bridge. Lets a
+    # Windows box (no CEC) still drive TV power. See cec-bridge/.
+    cec_bridge = None
+    cb_raw = raw.get("cec_bridge")
+    if cb_raw is not None:
+        if not isinstance(cb_raw, dict):
+            raise ConfigError("cec_bridge must be an object")
+        host = cb_raw.get("host")
+        if not isinstance(host, str) or not host.strip():
+            raise ConfigError("cec_bridge.host must be a non-empty string")
+        cb_port = cb_raw.get("port", 8799)
+        if not isinstance(cb_port, int) or not (1 <= cb_port <= 65535):
+            raise ConfigError("cec_bridge.port must be an int 1-65535")
+        cb_token = cb_raw.get("token")
+        if not isinstance(cb_token, str) or not cb_token:
+            raise ConfigError("cec_bridge.token must be a non-empty string")
+        cec_bridge = {"host": host.strip(), "port": int(cb_port),
+                      "token": cb_token}
+
+    # Optional Roku TV (ECP over plain HTTP). A reachable host is enough — there
+    # is no pairing. The optional name is the friendly name captured at add time.
+    roku = None
+    roku_raw = raw.get("roku")
+    if roku_raw is not None:
+        if not isinstance(roku_raw, dict):
+            raise ConfigError("roku must be an object")
+        rhost = roku_raw.get("host")
+        if not isinstance(rhost, str) or not rhost.strip():
+            raise ConfigError("roku.host must be a non-empty string")
+        roku = {"host": rhost.strip()}
+        rname = roku_raw.get("name")
+        if rname is not None:
+            if not isinstance(rname, str):
+                raise ConfigError("roku.name must be a string")
+            roku["name"] = rname
+
+    return units, actions, order, port, launchers, panel, cec_bridge, roku
+
+
+def load_config(path):
+    """Load config.json into the module globals; fall back to defaults."""
+    global WATCHLIST, WATCHLIST_NAMES, ACTIONS, ACTION_ORDER, CONFIG_PORT
+    global LAUNCHERS, CONFIG_PATH, CONFIG_PANEL, CONFIG_CEC_BRIDGE, ALLOW_APP_UPDATE
+    global ALLOW_UPDATE_CHECK
+    global CONFIG_ROKU, ALLOW_APP_LAUNCHERS
+    # ABSOLUTE on purpose: every rewrite derives the temp-file directory from
+    # os.path.dirname(CONFIG_PATH), and a relative path has no directory part.
+    # That fell through to the process CWD -- for a service, System32. See
+    # _write_config_atomic.
+    CONFIG_PATH = os.path.abspath(path)  # remembered so launcher POST/DELETE can rewrite it
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            ALLOW_APP_UPDATE = bool(raw.get("allow_app_update", False))
+            ALLOW_UPDATE_CHECK = bool(raw.get("allow_update_check", False))
+            ALLOW_APP_LAUNCHERS = bool(raw.get("allow_app_launchers", False))
+        units, actions, order, port, launchers, panel, cec_bridge, roku = \
+            _parse_config(raw)
+    except FileNotFoundError:
+        print("warning: config %s not found, using built-in generic defaults"
+              % path, file=sys.stderr, flush=True)
+        return
+    except (OSError, ValueError) as e:  # ValueError covers JSON + ConfigError
+        print("warning: invalid config %s (%s), using built-in generic defaults"
+              % (path, e), file=sys.stderr, flush=True)
+        return
+    # The agent's OWN log is always available, whatever the config says. A
+    # config.json that lists its own units REPLACES the defaults, which would
+    # otherwise make the agent's log un-fetchable on exactly the machines whose
+    # owner customised the watchlist -- and the journal route rejects any unit
+    # not on this allowlist (400), so it has to be a member, not a special case
+    # bypassing the check.
+    if not any(name == AGENT_LOG_UNIT for name, _s in units):
+        units = list(units) + [(AGENT_LOG_UNIT, "user")]
+    WATCHLIST = units
+    WATCHLIST_NAMES = {name for name, _scope in WATCHLIST}
+    ACTIONS = actions
+    ACTION_ORDER = order
+    CONFIG_PORT = port
+    LAUNCHERS = launchers
+    CONFIG_PANEL = panel
+    CONFIG_CEC_BRIDGE = cec_bridge
+    CONFIG_ROKU = roku
+    print("config loaded from %s: %d units, %d actions, %d launchers"
+          % (path, len(WATCHLIST), len(ACTIONS), len(LAUNCHERS)), flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Update check (/api/update/check) + opt-in apply (/api/update/apply).
+# Mirrors the Linux agent (see couchsided.py for the privacy rationale): the
+# BOX does the cached GitHub read; the app reads the result over the LAN and
+# never touches the internet. Windows checks its own release repository. Apply installs the signed CouchsideSetup.exe from
+# the emerytech/couchside-windows release (verified; see update_apply).
+# ---------------------------------------------------------------------------
+# App-triggered apply: the signed installer from the couchside-windows repo's
+# latest PUBLISHED release (GitHub's /releases/latest skips drafts and
+# prereleases). Never `iwr ... | iex`: nothing runs unless it verifies.
+_UPDATE_WIN_RELEASE_API = \
+    "https://api.github.com/repos/emerytech/couchside-windows/releases/latest"
+_UPDATE_ASSET_PREFIX = \
+    "https://github.com/emerytech/couchside-windows/releases/download/"
+_UPDATE_SETUP_ASSET = "CouchsideSetup.exe"
+_UPDATE_SUM_ASSET = "CouchsideSetup.exe.sha256"
+# Hosts a release-asset download may be redirected to.
+_UPDATE_DL_HOSTS = ("github.com", "objects.githubusercontent.com",
+                    "release-assets.githubusercontent.com")
+_UPDATE_MAX_BYTES = 200 * 1024 * 1024
+# Authenticode signer (SignPath Foundation's certificate, used by many OSS
+# projects) -- so the per-release SHA256 and ProductName below are what tie
+# the file to Couchside specifically.
+_UPDATE_SIGNER_RE = re.compile(r'(^|,\s*)CN="?SignPath Foundation"?\s*(,|$)')
+_UPDATE_PRODUCT_NAME = "Couchside"
+_UPDATE_TTL_S = 6 * 3600
+_update_cache = {"at": 0.0, "data": None}
+_update_lock = threading.Lock()
+
+
+def _http_text(url, timeout=8):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "couchside-agent/%s" % VERSION,
+        "Accept": "application/vnd.github+json"})
+    # Update metadata is pinned to this repository; no redirect is necessary.
+    if url != _UPDATE_WIN_RELEASE_API:
+        raise ValueError("unexpected update metadata URL")
+    opener = urllib.request.build_opener(_UpdateRedirectHandler(()))
+    with opener.open(req, timeout=timeout) as r:
+        body = r.read(1_000_001)
+        if len(body) > 1_000_000:
+            raise ValueError("update metadata too large")
+        return body.decode("utf-8")
+
+
+def _ver_tuple(s):
+    out = []
+    for p in (s or "").strip().split("."):
+        digits = "".join(ch for ch in p if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out) or (0,)
+
+
+def update_check(force=False):
+    """Whether a newer signed Windows agent release exists. Cached 6h; never
+    raises (network failure -> available:false with an error string).
+    Opt-in: with allow_update_check off, returns a "disabled" result without
+    touching the network."""
+    if not ALLOW_UPDATE_CHECK:
+        return {"available": False, "installed": VERSION, "latest": None,
+                "tag": None, "notes": None, "disabled": True,
+                "checked_at": int(time.time())}
+    now = time.monotonic()
+    with _update_lock:
+        c = _update_cache
+        if not force and c["data"] is not None and now - c["at"] < _UPDATE_TTL_S:
+            return c["data"]
+    installed = VERSION
+    try:
+        meta = json.loads(_http_text(_UPDATE_WIN_RELEASE_API))
+        latest, _assets = _release_candidate(meta, require_assets=False)
+        installed_number = _release_version(installed)
+        # Preview builds may check versions, but can never apply an update.
+        if installed_number is None:
+            m = re.match(r"^(\d+)\.(\d+)\.(\d+)-", installed)
+            installed_number = tuple(map(int, m.groups())) if m else (0,)
+        data = {"available": _release_version(latest) > installed_number,
+                "installed": installed, "latest": latest,
+                "tag": meta.get("tag_name") or None,
+                "notes": (meta.get("body") or "").strip() or None,
+                "checked_at": int(time.time())}
+    except Exception as e:
+        data = {"available": False, "installed": installed, "latest": None,
+                "tag": None, "notes": None, "error": str(e)[:200],
+                "checked_at": int(time.time())}
+    with _update_lock:
+        _update_cache["at"] = now
+        _update_cache["data"] = data
+    return data
+
+
+def mock_update_check():
+    return {"available": True, "installed": VERSION, "latest": "9.9.9-win",
+            "tag": "v9.9.9",
+            "notes": "## Mock update\n- A shiny new thing\n- A small fix",
+            "checked_at": int(time.time())}
+
+
+_UPDATE_LOG = os.path.join(os.environ.get("TEMP", os.getcwd()),
+                           "couchside-update.log")
+_apply_lock = threading.Lock()
+_apply_state = {"state": "idle"}     # idle | running | launched | failed
+_self_sig_cache = {}
+_MANUAL_UPDATE_HINT = ("Install the latest CouchsideSetup.exe yourself from "
+                       "https://github.com/emerytech/couchside-windows/releases")
+
+
+def _update_log(msg):
+    line = "%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    print("[update] " + msg, flush=True)
+    try:
+        with open(_UPDATE_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def _windows_update_env(**values):
+    """Use inbox Windows PowerShell modules, not inherited PowerShell 7 paths.
+
+    Limit this to update subprocesses; do not change the agent or user's environment.
+    """
+    env = dict(os.environ, **values)
+    env["PSModulePath"] = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                     "System32", "WindowsPowerShell", "v1.0", "Modules")
+    return env
+
+
+def _authenticode_info(path):
+    """Get-AuthenticodeSignature + version resource for `path`, via Windows
+    PowerShell by absolute path. The file path goes in through an environment
+    variable, never into the command text. Raises on any failure."""
+    ps_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                          "System32", "WindowsPowerShell", "v1.0",
+                          "powershell.exe")
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$p=$env:COUCHSIDE_VERIFY_PATH;"
+        "$s=Get-AuthenticodeSignature -LiteralPath $p;"
+        "$v=(Get-Item -LiteralPath $p).VersionInfo;"
+        "$subj='';if($s.SignerCertificate){$subj=$s.SignerCertificate.Subject};"
+        "[pscustomobject]@{status=[string]$s.Status;subject=$subj;"
+        "timestamped=[bool]$s.TimeStamperCertificate;"
+        "product=([string]$v.ProductName).Trim();version=([string]$v.ProductVersion).Trim()}"
+        "|ConvertTo-Json -Compress")
+    env = _windows_update_env(COUCHSIDE_VERIFY_PATH=os.path.abspath(path))
+    r = subprocess.run([ps_exe, "-NoProfile", "-NonInteractive", "-Command",
+                        script], capture_output=True, text=True, timeout=90,
+                       env=env, creationflags=_RUN_FLAGS)
+    if r.returncode != 0:
+        raise RuntimeError("signature check failed: %s"
+                           % (r.stderr or r.stdout).strip()[:200])
+    return json.loads(r.stdout.strip())
+
+
+def _signpath_signed(info):
+    return (info.get("status") == "Valid"
+            and bool(_UPDATE_SIGNER_RE.search(info.get("subject") or ""))
+            and bool(info.get("timestamped")))
+
+
+def _self_update_blocker():
+    """None if THIS agent may self-update, else a user-facing reason. Only a
+    SignPath-signed couchside-agent.exe can: an unsigned/RC/dev build or a
+    Python-source install has no trusted signing identity to hold the update
+    to, so it refuses rather than install something it can't vouch for."""
+    if not IS_WINDOWS:
+        return "App-triggered updates are only available on Windows."
+    if _release_version(VERSION) is None:
+        return "Preview/development builds cannot apply updates. " + _MANUAL_UPDATE_HINT + "."
+    if not getattr(sys, "frozen", False):
+        return ("This agent runs from Python source, so app-triggered updates "
+                "are unavailable. Re-run install.ps1 to update.")
+    if "blocker" not in _self_sig_cache:
+        try:
+            info = _authenticode_info(sys.executable)
+            _self_sig_cache["blocker"] = None if (_signpath_signed(info) and
+                info.get("product") == _UPDATE_PRODUCT_NAME and
+                _numeric_version(info.get("version")) == _release_version(VERSION) + (0,)) else (
+                "This agent build is not signed by SignPath Foundation "
+                "(signature status: %s), e.g. a release candidate or "
+                "developer build, so app-triggered updates are refused. %s."
+                % (info.get("status") or "unknown", _MANUAL_UPDATE_HINT))
+        except Exception as e:
+            # Not cached: a transient PowerShell failure shouldn't stick.
+            return ("Could not verify this agent's own signature (%s); "
+                    "app-triggered update refused." % str(e)[:120])
+    return _self_sig_cache["blocker"]
+
+
+def _release_version(value):
+    """Only stable Windows release tags are installable (no RC/dev suffix)."""
+    match = re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-win", value or "")
+    return tuple(map(int, match.groups())) if match else None
+
+
+def _numeric_version(value):
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)\.(\d+)", value or "")
+    return tuple(map(int, match.groups())) if match else None
+
+
+def _release_candidate(meta, require_assets=True):
+    if not isinstance(meta, dict) or meta.get("draft") is not False or meta.get("prerelease") is not False:
+        raise ValueError("latest release is not a published stable release")
+    tag = meta.get("tag_name", "")
+    latest = tag[1:] if isinstance(tag, str) and tag.startswith("v") else ""
+    if _release_version(latest) is None:
+        raise ValueError("invalid stable Windows release tag")
+    if not require_assets:
+        return latest, {}
+    assets = {}
+    for asset in meta.get("assets") or []:
+        name = asset.get("name")
+        if name not in (_UPDATE_SETUP_ASSET, _UPDATE_SUM_ASSET):
+            continue
+        expected = _UPDATE_ASSET_PREFIX + tag + "/" + name
+        if name in assets or asset.get("browser_download_url") != expected:
+            raise ValueError("duplicate or unexpected release asset URL")
+        assets[name] = expected
+    if len(assets) != 2:
+        raise ValueError("release lacks installer or checksum")
+    return latest, assets
+
+
+def _validate_update_url(url, hosts):
+    parsed = urlparse(url)
+    if (parsed.scheme != "https" or parsed.hostname not in hosts
+            or parsed.username is not None or parsed.password is not None
+            or parsed.port not in (None, 443) or parsed.fragment):
+        raise ValueError("untrusted update download URL")
+
+
+class _UpdateRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, hosts):
+        self.hosts = hosts
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Reject BEFORE urllib sends anything to the redirect destination.
+        _validate_update_url(newurl, self.hosts)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch_asset(url, dest=None, limit=_UPDATE_MAX_BYTES):
+    """Bounded HTTPS downloads; validate every hop before following it."""
+    _validate_update_url(url, _UPDATE_DL_HOSTS)
+    req = urllib.request.Request(url, headers={"User-Agent": "couchside-agent/%s" % VERSION})
+    opener = urllib.request.build_opener(_UpdateRedirectHandler(_UPDATE_DL_HOSTS))
+    with opener.open(req, timeout=60) as r:
+        _validate_update_url(r.geturl(), _UPDATE_DL_HOSTS)
+        if dest is None:
+            body = r.read(limit + 1)
+            if len(body) > limit:
+                raise ValueError("download too large")
+            return body
+        h, total = hashlib.sha256(), 0
+        created = False
+        try:
+            with open(dest, "xb") as f:
+                created = True
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise ValueError("download too large")
+                    h.update(chunk)
+                    f.write(chunk)
+        except Exception:
+            # Never leave an incomplete executable available to a later attempt.
+            if created and os.path.isfile(dest):
+                os.unlink(dest)
+            raise
+        return h.hexdigest()
+
+
+_UPDATE_SUPERVISOR_PS = r'''
+$ErrorActionPreference = 'Stop'
+$stage = $env:COUCHSIDE_UPDATE_STAGE
+$setup = Join-Path $stage 'CouchsideSetup.exe'
+$result = 1
+try {
+    # Recheck the verified bytes immediately before launch. All paths are data,
+    # never PowerShell source, and this process retains the caller's privileges.
+    if ((Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash -ne $env:COUCHSIDE_UPDATE_SHA256) {
+        throw 'Installer changed after verification'
+    }
+    $args = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
+              ('/LOG="' + $env:COUCHSIDE_UPDATE_SETUP_LOG + '"'))
+    $child = Start-Process -FilePath $setup -ArgumentList $args -PassThru
+    $null = $child.Handle
+    $child.WaitForExit()
+    $result = $child.ExitCode
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+} finally {
+    # Setup normally terminates the agent that requested the update. This
+    # independent supervisor survives that termination and waits for setup.
+    # Never recursively remove a staging tree or follow a reparse point.
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        try {
+            if (-not [IO.Directory]::Exists($stage)) { break }
+            if (([IO.File]::GetAttributes($stage) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { break }
+            if ([IO.File]::Exists($setup)) { [IO.File]::Delete($setup) }
+            [IO.Directory]::Delete($stage, $false)
+            break
+        } catch { Start-Sleep -Seconds 1 }
+    }
+}
+exit $result
+'''
+
+
+def _launch_update_supervisor(stage, digest):
+    ps = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'),
+                      'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    env = _windows_update_env(COUCHSIDE_UPDATE_STAGE=stage,
+               COUCHSIDE_UPDATE_SHA256=digest,
+               COUCHSIDE_UPDATE_SETUP_LOG=_UPDATE_LOG + '.setup.txt')
+    command = base64.b64encode(_UPDATE_SUPERVISOR_PS.encode('utf-16le')).decode('ascii')
+    return subprocess.Popen([ps, '-NoProfile', '-NonInteractive', '-EncodedCommand', command],
+                            # PowerShell exits without executing its command under
+                            # DETACHED_PROCESS on Windows. NO_WINDOW still gives it
+                            # a working console environment without a visible window.
+                            env=env, creationflags=(0x08000000 | 0x00000200) if IS_WINDOWS else 0, close_fds=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+
+
+def _update_apply_worker():
+    """Download -> verify SHA256 -> verify Authenticode -> run silently.
+    Every failure stops before anything is executed (fail closed)."""
+    tmpdir = None
+    try:
+        meta = json.loads(_http_text(_UPDATE_WIN_RELEASE_API))
+        latest, assets = _release_candidate(meta)
+        tag = meta["tag_name"]
+        installed = _release_version(VERSION)
+        if installed is None or _release_version(latest) <= installed:
+            raise RuntimeError("no newer stable Windows release")
+        setup_url = assets[_UPDATE_SETUP_ASSET]
+        sum_url = assets[_UPDATE_SUM_ASSET]
+        sums = _fetch_asset(sum_url, limit=4096).decode("ascii", "replace")
+        match = re.fullmatch(r"([0-9A-Fa-f]{64})[ \t]+\*?CouchsideSetup\.exe\s*", sums)
+        if not match:
+            raise RuntimeError("invalid installer checksum file")
+        expected = match.group(1).lower()
+        tmpdir = tempfile.mkdtemp(prefix="couchside-update-")
+        setup = os.path.join(tmpdir, _UPDATE_SETUP_ASSET)
+        _update_log("downloading %s %s" % (tag, _UPDATE_SETUP_ASSET))
+        got = _fetch_asset(setup_url, dest=setup)
+        if not hmac.compare_digest(got, expected):
+            raise RuntimeError("SHA256 mismatch (expected %s, got %s)"
+                               % (expected, got))
+        info = _authenticode_info(setup)
+        if not _signpath_signed(info):
+            raise RuntimeError("installer signature not trusted (status %s, "
+                               "signer %r, timestamped %s)"
+                               % (info.get("status"), info.get("subject"),
+                                  info.get("timestamped")))
+        if info.get("product") != _UPDATE_PRODUCT_NAME or \
+                _numeric_version(info.get("version")) != _release_version(latest) + (0,):
+            raise RuntimeError("installer metadata mismatch (product %r, "
+                               "version %r, release %s)"
+                               % (info.get("product"), info.get("version"), tag))
+        _update_log("verified %s (sha256 %s, signer %s); running silently"
+                    % (tag, got, info.get("subject")))
+        # Inno Setup silent upgrade. Previously chosen [Tasks] are reused
+        # (UsePreviousTasks), so optional changes stay as the user set them.
+        # install.ps1 still asks for UAC on this PC's screen.
+        child = _launch_update_supervisor(tmpdir, got)
+        with _apply_lock:
+            _apply_state.clear()
+            _apply_state.update(state="launched", version=latest,
+                                at=int(time.time()))
+        # The supervisor, not the replaceable agent, owns post-install cleanup.
+        exit_code = child.wait()
+        if exit_code != 0:
+            raise RuntimeError("installer exited with code %s" % exit_code)
+        with _apply_lock:
+            _apply_state.update(state="completed", at=int(time.time()))
+    except Exception as e:
+        _update_log("update refused/failed: %s" % e)
+        with _apply_lock:
+            _apply_state.clear()
+            _apply_state.update(state="failed", error=str(e)[:300],
+                                at=int(time.time()))
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def update_apply():
+    """Start a verified update in the background. Returns (http_code, body).
+    Caller must have checked ALLOW_APP_UPDATE. Takes nothing from the request:
+    the only possible action is installing the newest published, verified
+    CouchsideSetup.exe."""
+    if not ALLOW_APP_UPDATE:
+        return 403, {"ok": False, "started": False, "error": "app-triggered updates disabled"}
+    blocker = _self_update_blocker()
+    if blocker:
+        return 409, {"ok": False, "started": False, "error": blocker}
+    with _apply_lock:
+        if _apply_state.get("state") in ("running", "launched", "completed"):
+            return 409, {"ok": False, "started": False,
+                         "error": "an update is already in progress"}
+        _apply_state.clear()
+        _apply_state.update(state="running", at=int(time.time()))
+    threading.Thread(target=_update_apply_worker, daemon=True,
+                     name="update-apply").start()
+    return 202, {"ok": True, "started": True, "log": _UPDATE_LOG}
+
+
+def update_apply_state():
+    with _apply_lock:
+        return dict(_apply_state)
+
+
+# ---------------------------------------------------------------------------
+# Real-mode data collection (Windows; each helper degrades gracefully)
+# ---------------------------------------------------------------------------
+
+
+def read_uptime_s():
+    """Milliseconds since boot via GetTickCount64 (monotonic across sleep)."""
+    try:
+        _kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+        return int(_kernel32.GetTickCount64() // 1000)
+    except Exception:
+        return 0
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_uint32),
+        ("dwMemoryLoad", ctypes.c_uint32),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
+
+
+def read_mem():
+    try:
+        st = _MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(st)
+        if not _kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            raise OSError("GlobalMemoryStatusEx failed")
+        total_mb = int(st.ullTotalPhys // (1024 * 1024))
+        avail_mb = int(st.ullAvailPhys // (1024 * 1024))
+        return {
+            "total_mb": total_mb,
+            "used_mb": total_mb - avail_mb,
+            "available_mb": avail_mb,
+        }
+    except Exception:
+        return {"total_mb": 0, "used_mb": 0, "available_mb": 0}
+
+
+# --- CPU "load": Windows has no loadavg, so a background sampler turns
+# GetSystemTimes deltas into a utilization-based approximation: instantaneous
+# busy-fraction * logical cores, smoothed with 1/5/15-minute EMAs so the app's
+# three load slots keep their familiar meaning.
+_LOAD_LOCK = threading.Lock()
+_LOAD = [0.0, 0.0, 0.0]
+_LOAD_SAMPLE_S = 5.0
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", ctypes.c_uint32),
+                ("dwHighDateTime", ctypes.c_uint32)]
+
+    def to_int(self):
+        return (self.dwHighDateTime << 32) | self.dwLowDateTime
+
+
+def _system_times():
+    """(idle, kernel, user) 100ns tick counters, or None."""
+    idle, kern, user = _FILETIME(), _FILETIME(), _FILETIME()
+    if not _kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern),
+                                    ctypes.byref(user)):
+        return None
+    return idle.to_int(), kern.to_int(), user.to_int()
+
+
+def _load_sampler():
+    """Daemon thread: sample CPU busy-fraction every _LOAD_SAMPLE_S seconds and
+    fold it into the three EMAs. Kernel time includes idle time on Windows, so
+    busy = (kernel + user - idle) / (kernel + user)."""
+    ncpu = os.cpu_count() or 1
+    prev = _system_times()
+    # EMA alphas for 1/5/15-minute horizons at our sample interval.
+    alphas = [1 - pow(2.718281828, -_LOAD_SAMPLE_S / w) for w in (60.0, 300.0, 900.0)]
+    while True:
+        time.sleep(_LOAD_SAMPLE_S)
+        cur = _system_times()
+        if prev is None or cur is None:
+            prev = cur
+            continue
+        d_idle = cur[0] - prev[0]
+        d_kern = cur[1] - prev[1]
+        d_user = cur[2] - prev[2]
+        prev = cur
+        total = d_kern + d_user
+        if total <= 0:
+            continue
+        busy = max(0.0, min(1.0, (total - d_idle) / total))
+        inst = busy * ncpu  # loadavg-like: runnable-ish work in "cores"
+        with _LOAD_LOCK:
+            for i, a in enumerate(alphas):
+                _LOAD[i] = _LOAD[i] * (1 - a) + inst * a
+
+
+def start_load_sampler():
+    t = threading.Thread(target=_load_sampler, daemon=True,
+                         name="load-sampler")
+    t.start()
+
+
+def read_load():
+    with _LOAD_LOCK:
+        return [round(x, 2) for x in _LOAD]
+
+
+# --- CPU temperature: WMI thermal zone, which many consumer boards simply do
+# not populate (or gate behind admin). One PowerShell probe, cached; None when
+# unavailable, which the app already tolerates. Failures back off to a slow
+# retry rather than latching dead: a transient PowerShell hiccup (or a WMI
+# provider that comes up late) should not permanently blank the temperature.
+_TEMP_TTL = 30.0
+_TEMP_FAIL_TTL = 600.0
+_TEMP_CACHE = {"at": 0.0, "val": None, "ttl": _TEMP_TTL}
+
+
+def read_cpu_temp_c():
+    now = time.monotonic()
+    if now - _TEMP_CACHE["at"] <= _TEMP_CACHE["ttl"]:
+        return _TEMP_CACHE["val"]
+    _TEMP_CACHE["at"] = now
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance -Namespace root/wmi "
+             "-ClassName MSAcpi_ThermalZoneTemperature "
+             "-ErrorAction Stop | Select-Object -First 1).CurrentTemperature"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=_RUN_FLAGS)
+        raw = (r.stdout or "").strip()
+        if r.returncode != 0 or not raw:
+            raise ValueError(raw or "no thermal zone")
+        # WMI reports tenths of Kelvin.
+        temp_c = round(int(float(raw)) / 10.0 - 273.15, 1)
+        if not (-50.0 < temp_c < 150.0):
+            raise ValueError("implausible temperature %r" % temp_c)
+        _TEMP_CACHE["val"] = temp_c
+        _TEMP_CACHE["ttl"] = _TEMP_TTL
+        return temp_c
+    except Exception:
+        # Most boxes without a readable thermal zone stay that way, so back
+        # off hard (10 min) instead of spawning PowerShell every 30s — but
+        # never latch permanently.
+        _TEMP_CACHE["val"] = None
+        _TEMP_CACHE["ttl"] = _TEMP_FAIL_TTL
+        return None
+
+
+DRIVE_FIXED = 3
+
+
+def read_disks():
+    """Every fixed drive with real capacity (C:\\, D:\\, ...)."""
+    disks = []
+    try:
+        _kernel32.GetLogicalDrives.restype = ctypes.c_uint32
+        mask = _kernel32.GetLogicalDrives()
+    except Exception:
+        mask = 0
+    for i in range(26):
+        if not (mask >> i) & 1:
+            continue
+        mount = "%s:\\" % chr(ord("A") + i)
+        try:
+            if _kernel32.GetDriveTypeW(ctypes.c_wchar_p(mount)) != DRIVE_FIXED:
+                continue
+            du = shutil.disk_usage(mount)
+            if du.total < 1024 ** 3:
+                continue
+            pct = int(round(du.used * 100.0 / du.total)) if du.total else 0
+            disks.append({
+                "mount": mount,
+                "total_gb": round(du.total / (1024 ** 3), 1),
+                "used_gb": round(du.used / (1024 ** 3), 1),
+                "free_gb": round(du.free / (1024 ** 3), 1),
+                "pct": pct,
+            })
+        except Exception:
+            continue
+    return disks
+
+
+# --- primary-interface network facts (for the app's Wake-on-LAN power path) --
+_NET_TTL = 30.0
+_NET_CACHE = {"at": 0.0, "val": None}
+
+MIB_IF_TYPE_ETHERNET = 6
+IF_TYPE_IEEE80211 = 71
+MAX_ADAPTER_NAME_LENGTH = 256
+MAX_ADAPTER_DESCRIPTION_LENGTH = 128
+MAX_ADAPTER_ADDRESS_LENGTH = 8
+
+
+class _IP_ADDR_STRING(ctypes.Structure):
+    pass
+
+
+_IP_ADDR_STRING._fields_ = [
+    ("Next", ctypes.POINTER(_IP_ADDR_STRING)),
+    ("IpAddress", ctypes.c_char * 16),
+    ("IpMask", ctypes.c_char * 16),
+    ("Context", ctypes.c_uint32),
+]
+
+
+class _IP_ADAPTER_INFO(ctypes.Structure):
+    pass
+
+
+_IP_ADAPTER_INFO._fields_ = [
+    ("Next", ctypes.POINTER(_IP_ADAPTER_INFO)),
+    ("ComboIndex", ctypes.c_uint32),
+    ("AdapterName", ctypes.c_char * (MAX_ADAPTER_NAME_LENGTH + 4)),
+    ("Description", ctypes.c_char * (MAX_ADAPTER_DESCRIPTION_LENGTH + 4)),
+    ("AddressLength", ctypes.c_uint32),
+    ("Address", ctypes.c_ubyte * MAX_ADAPTER_ADDRESS_LENGTH),
+    ("Index", ctypes.c_uint32),
+    ("Type", ctypes.c_uint32),
+    ("DhcpEnabled", ctypes.c_uint32),
+    ("CurrentIpAddress", ctypes.POINTER(_IP_ADDR_STRING)),
+    ("IpAddressList", _IP_ADDR_STRING),
+    ("GatewayList", _IP_ADDR_STRING),
+    ("DhcpServer", _IP_ADDR_STRING),
+    ("HaveWins", ctypes.c_int),
+    ("PrimaryWinsServer", _IP_ADDR_STRING),
+    ("SecondaryWinsServer", _IP_ADDR_STRING),
+    ("LeaseObtained", ctypes.c_long),
+    ("LeaseExpires", ctypes.c_long),
+]
+
+
+def _best_iface_index():
+    """Adapter index the default route would use, via GetBestInterface toward
+    TEST-NET-1 (192.0.2.1, never actually sent). None on failure."""
+    try:
+        dest = _ws2_32.inet_addr(b"192.0.2.1")
+        index = ctypes.c_uint32(0)
+        if _iphlpapi.GetBestInterface(dest, ctypes.byref(index)) != 0:
+            return None
+        return index.value
+    except Exception:
+        return None
+
+
+def _adapters_info():
+    """All adapters from GetAdaptersInfo as a list of _IP_ADAPTER_INFO."""
+    size = ctypes.c_ulong(0)
+    _iphlpapi.GetAdaptersInfo(None, ctypes.byref(size))
+    if size.value == 0:
+        return []
+    buf = ctypes.create_string_buffer(size.value)
+    if _iphlpapi.GetAdaptersInfo(buf, ctypes.byref(size)) != 0:
+        return []
+    adapters = []
+    node = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_INFO))
+    while node:
+        adapters.append(node.contents)
+        node = node.contents.Next
+    return adapters
+
+
+def _wol_armed_for_mac(mac):
+    """Best-effort WakeOnMagicPacket state via PowerShell; None when the cmdlet
+    is unavailable (non-admin, older Windows) or the adapter isn't found."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-NetAdapter | Where-Object {$_.MacAddress -replace '-',':' "
+             "-eq '%s'} | Get-NetAdapterPowerManagement "
+             "-ErrorAction Stop).WakeOnMagicPacket" % mac.upper()],
+            capture_output=True, text=True, timeout=10,
+            creationflags=_RUN_FLAGS)
+        raw = (r.stdout or "").strip().lower()
+        if r.returncode != 0 or not raw:
+            return None
+        return raw == "enabled"
+    except Exception:
+        return None
+
+
+def read_net():
+    """Primary-interface facts. Every field degrades to None."""
+    try:
+        index = _best_iface_index()
+        if index is None:
+            return {"iface": None, "mac": None, "wired": None, "wol_armed": None}
+        for ad in _adapters_info():
+            if ad.Index != index:
+                continue
+            mac = ":".join("%02x" % b for b in ad.Address[:ad.AddressLength]) or None
+            wired = None
+            if ad.Type == MIB_IF_TYPE_ETHERNET:
+                wired = True
+            elif ad.Type == IF_TYPE_IEEE80211:
+                wired = False
+            desc = ad.Description.decode("mbcs", "replace").strip() or None
+            return {"iface": desc, "mac": mac, "wired": wired,
+                    "wol_armed": _wol_armed_for_mac(mac) if mac else None}
+        return {"iface": None, "mac": None, "wired": None, "wol_armed": None}
+    except Exception:
+        return {"iface": None, "mac": None, "wired": None, "wol_armed": None}
+
+
+def net_info_cached():
+    now = time.monotonic()
+    if _NET_CACHE["val"] is None or now - _NET_CACHE["at"] > _NET_TTL:
+        _NET_CACHE["val"] = read_net()
+        _NET_CACHE["at"] = now
+    return _NET_CACHE["val"]
+
+
+# Box capability summary (rides /api/status); see the Linux agent's real_status
+# for the full rationale. Mirrors the same six flags so one app codebase reads
+# either agent. Snapshotted once in main() after the detectors run; a hint, not
+# authority; absent on older agents (app keeps its 404 fallbacks); all True in
+# --mock. The `gamepad` cap uses vigem_ready() (a real ViGEmBus connect probe),
+# NOT vigem_available() (DLL-only) — and it is re-probed LIVE in real_status, not
+# frozen, so a bus that appears/disappears after startup is reflected without a
+# restart.
+CAPS = {}  # set once by set_caps() in main(); returned by real_/mock_status
+
+
+def set_caps(mock):
+    """Snapshot box capabilities into CAPS. Call in main() AFTER set_tv/
+    set_screen/set_power_schedule so the availability helpers reflect startup
+    detection. In --mock everything reads True."""
+    global CAPS
+
+    def safe(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
+    if mock:
+        # screensaver + couchmode + desktop stay False even in mock: all are
+        # gamescope/SteamOS features the Windows agent does not implement
+        # (see the Linux agent). Windows has its own desktop shortcuts (the
+        # WIN/ALT-TAB cluster on a ViGEm box), not the Plasma desktop-nav cap.
+        CAPS = {k: True for k in
+                ("gamepad", "steam", "media", "tv", "screen", "power_schedule",
+                 "launchers", "input_only")}
+        CAPS["screensaver"] = False
+        CAPS["couchmode"] = False
+        CAPS["desktop"] = False
+        return
+    CAPS = {
+        # vigem_ready(), NOT vigem_available(): the cap must reflect an actual
+        # ViGEmBus connect, not just the DLL loading, or a driver-less box reports
+        # gamepad:true and the app opens a pad it can never create (see vigem_ready).
+        "gamepad": safe(vigem_ready),
+        # Protocol support, independent of ViGEm; Win32 injection can still be paused.
+        "input_only": True,
+        "steam": _steam_root() is not None,
+        "launchers": safe(_any_launcher_source),
+        "media": safe(smtc_available),
+        "tv": safe(lambda: _tv_hw_backend() is not None or soft_available()),
+        "screen": _SCREEN is not None,
+        "power_schedule": safe(wake_available),
+        "screensaver": False,
+        # Desktop->TV Game Mode handoff is gamescope/SteamOS-only, and
+        # "desktop" (the Plasma desktop-nav cluster) is Linux-only too.
+        "couchmode": False,
+        "desktop": False,
+    }
+
+
+# Metrics history ring (rides /api/status as "history") — see the Linux agent
+# for the rationale. Sampled on the status poll, rate-limited, no thread.
+HISTORY_LEN = 30
+HISTORY_MIN_INTERVAL_S = 10
+_HISTORY = {"t": [], "temp": [], "load": [], "mem_pct": []}
+_HISTORY_LOCK = threading.Lock()
+
+
+def _record_history(now, temp, load1, mem):
+    mem_pct = None
+    if isinstance(mem, dict) and mem.get("total_mb"):
+        mem_pct = round(mem.get("used_mb", 0) * 100.0 / mem["total_mb"], 1)
+    with _HISTORY_LOCK:
+        if _HISTORY["t"] and now - _HISTORY["t"][-1] < HISTORY_MIN_INTERVAL_S:
+            return
+        for key, val in (("t", now), ("temp", temp),
+                         ("load", load1), ("mem_pct", mem_pct)):
+            _HISTORY[key].append(val)
+            if len(_HISTORY[key]) > HISTORY_LEN:
+                del _HISTORY[key][0]
+
+
+def _history_snapshot():
+    with _HISTORY_LOCK:
+        return {k: list(v) for k, v in _HISTORY.items()}
+
+
+def real_status():
+    load = read_load()
+    temp = read_cpu_temp_c()
+    mem = read_mem()
+    now = int(time.time())
+    _record_history(now, temp, load[0] if load else None, mem)
+    return {
+        "hostname": socket.gethostname().split(".")[0],
+        "time": now,
+        "uptime_s": read_uptime_s(),
+        "load": load,
+        "cpu_temp_c": temp,
+        "mem": mem,
+        "disks": read_disks(),
+        "net": net_info_cached(),
+        "agent_version": VERSION,
+        # WHY mouse/keyboard can't drive an admin window when the agent is not
+        # elevated (Windows UIPI). Additive; the app uses it to explain the limit
+        # and point at the fix (run elevated, or the signed uiAccess build).
+        "input_privilege": _process_privilege(),
+        # gamepad is re-probed live (cached, self-healing) rather than read from
+        # the frozen startup snapshot: the ViGEmBus driver can come up (or go
+        # away) after the agent started, and a stale true here is what wedges the
+        # app's pad. The other caps are stable startup facts. See vigem_ready().
+        "caps": dict(CAPS, gamepad=vigem_ready()),
+        "history": _history_snapshot(),
+    }
+
+
+# --- units: Windows services via sc.exe --------------------------------------
+# `sc query` STATE values -> (active, sub) in systemd vocabulary so the app's
+# existing unit UI just works.
+_SC_STATE_MAP = {
+    "1": ("inactive", "dead"),        # STOPPED
+    "2": ("activating", "start"),     # START_PENDING
+    "3": ("deactivating", "stop"),    # STOP_PENDING
+    "4": ("active", "running"),       # RUNNING
+    "5": ("deactivating", "stop"),    # CONTINUE_PENDING (rare; close enough)
+    "6": ("inactive", "paused"),      # PAUSE_PENDING
+    "7": ("inactive", "paused"),      # PAUSED
+}
+
+
+def _sc_run(args):
+    """Run sc.exe and return stdout text (OEM codepage tolerated)."""
+    r = subprocess.run(["sc"] + args, capture_output=True, timeout=10,
+                       creationflags=_RUN_FLAGS)
+    return (r.stdout or b"").decode("utf-8", "replace"), r.returncode
+
+
+def real_units():
+    units = []
+    for name, scope in WATCHLIST:
+        active, sub, desc = "unknown", "unknown", ""
+        # AGENT_LOG_UNIT is NOT a Windows service -- it is in the watchlist only
+        # so the agent's own log passes the journal route's allowlist and shows
+        # up in the app's Logs picker. Querying it with sc.exe therefore always
+        # returned ERROR_SERVICE_DOES_NOT_EXIST, and the app rendered a
+        # permanent yellow "inactive/not-found" warning for a service that
+        # cannot exist (reported from a real Windows box).
+        #
+        # "active/running" here is a FACT, not a fallback: this code is running
+        # inside the agent, which is answering this very request. `log_only`
+        # lets the app drop it from the units card while keeping it in the Logs
+        # picker; an older app ignores the field and now simply sees the truth.
+        if name == AGENT_LOG_UNIT:
+            units.append({
+                "name": name, "scope": scope,
+                "active": "active", "sub": "running",
+                "description": "Couchside agent (log source, not a service)",
+                "log_only": True,
+            })
+            continue
+        try:
+            out, rc = _sc_run(["query", name])
+            if rc == 0:
+                for line in out.splitlines():
+                    s = line.strip()
+                    if s.upper().startswith("STATE"):
+                        # "STATE              : 4  RUNNING"
+                        val = s.split(":", 1)[1].strip().split()
+                        if val:
+                            active, sub = _SC_STATE_MAP.get(
+                                val[0], ("unknown", "unknown"))
+                        break
+            elif rc == 1060:  # ERROR_SERVICE_DOES_NOT_EXIST
+                active, sub = "inactive", "not-found"
+            dout, drc = _sc_run(["qdescription", name])
+            if drc == 0:
+                # "DESCRIPTION:  <text>" possibly wrapped onto the next line
+                lines = dout.splitlines()
+                for i, line in enumerate(lines):
+                    if "DESCRIPTION" in line.upper():
+                        after = line.split(":", 1)[1].strip() if ":" in line else ""
+                        if not after and i + 1 < len(lines):
+                            after = lines[i + 1].strip()
+                        desc = after
+                        break
+        except Exception:
+            pass
+        units.append({
+            "name": name,
+            "scope": scope,
+            "active": active,
+            "sub": sub,
+            "description": desc or name,
+        })
+    return units
+
+
+# --- journal: Windows Event Log via wevtutil ---------------------------------
+
+
+def _wevtutil_query(log, xpath, max_events, max_lines):
+    """Text lines for the newest `max_events` events from `log` matching
+    `xpath`, oldest-first (journalctl order), clamped to the LAST `max_lines`
+    lines. Empty list on any failure.
+
+    /f:text emits multi-line "Event[n]:" blocks and /rd:true reverses only
+    the EVENT order, so the flip back to oldest-first must operate on whole
+    blocks — reversing flat lines would render every event upside-down.
+    """
+    try:
+        r = subprocess.run(
+            ["wevtutil", "qe", log, "/q:%s" % xpath, "/c:%d" % max_events,
+             "/rd:true", "/f:text"],
+            capture_output=True, timeout=15, creationflags=_RUN_FLAGS)
+        if r.returncode != 0:
+            return []
+        text = (r.stdout or b"").decode("utf-8", "replace")
+    except Exception:
+        return []
+    blocks = []  # newest-first, as emitted
+    current = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("Event[") and current:
+            blocks.append(current)
+            current = []
+        current.append(line.rstrip())
+    if current:
+        blocks.append(current)
+    blocks.reverse()  # oldest-first, lines inside each block untouched
+    out = [line for block in blocks for line in block]
+    # The contract clamps LINES (journalctl -n), but /c: caps EVENTS; a
+    # multi-line-block query can overshoot badly, so tail-trim to honor it.
+    return out[-max_lines:]
+
+
+def _service_display_name(unit):
+    """The service's display name via `sc getdisplayname`, or None."""
+    try:
+        out, rc = _sc_run(["getdisplayname", unit])
+        if rc != 0:
+            return None
+        # Output: "[SC] GetServiceDisplayName SUCCESS  Name = Windows Audio"
+        for line in out.splitlines():
+            if "=" in line and "Name" in line:
+                name = line.split("=", 1)[1].strip()
+                return name or None
+    except Exception:
+        pass
+    return None
+
+
+def _xpath_escape(value):
+    return value.replace("'", "&apos;")
+
+
+AGENT_LOG_UNIT = "couchside-agent"   # reserved journal unit -> our own log file
+
+
+def _agent_log_lines(lines):
+    """Tail of the agent's own log file (see start_agent_log). Reads the rotated
+    .1 first so a tail that spans a rotation is still contiguous. Never raises;
+    an unreadable log returns a single explanatory line rather than an error, so
+    the Logs panel shows something actionable instead of failing."""
+    out = []
+    for path in (AGENT_LOG_PATH + ".1", AGENT_LOG_PATH):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                out.extend(f.read().splitlines())
+        except OSError:
+            continue
+    if not out:
+        return ["(no agent log yet at %s)" % AGENT_LOG_PATH]
+    return out[-lines:]
+
+
+def real_journal(unit, scope, lines):
+    """Event-log lines for a watched unit, or the agent's own log.
+
+    Provider-name query against System then Application: services log under
+    their own provider name when they log at all. Falls back to Service
+    Control Manager events, which carry the service's DISPLAY name (not the
+    key name) in their EventData — so the fallback resolves the display name
+    and matches either, keeping started/stopped/crashed visible for services
+    like Audiosrv ("Windows Audio") that never log under their own provider.
+    """
+    if unit == AGENT_LOG_UNIT:
+        return _agent_log_lines(lines)
+    safe = _xpath_escape(unit)
+    for log in ("System", "Application"):
+        out = _wevtutil_query(
+            log, "*[System[Provider[@Name='%s']]]" % safe, lines, lines)
+        if out:
+            return out
+    names = ["Data='%s'" % safe]
+    display = _service_display_name(unit)
+    if display and display != unit:
+        names.append("Data='%s'" % _xpath_escape(display))
+    return _wevtutil_query(
+        "System",
+        "*[System[Provider[@Name='Service Control Manager']] and "
+        "EventData[%s]]" % " or ".join(names), lines, lines)
+
+
+def real_action(action_id):
+    spec = ACTIONS[action_id]
+    start = time.monotonic()
+    if spec["detached"]:
+        proc = subprocess.Popen(
+            spec["cmd"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, creationflags=_DETACH_FLAGS,
+        )
+        # Give the child ~200ms: if it already died non-zero, don't report
+        # false success.
+        time.sleep(0.2)
+        rc = proc.poll()
+        if rc is not None and rc != 0:
+            try:
+                err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+            except Exception:
+                err = ""
+            return {
+                "ok": False,
+                "exit_code": rc,
+                "stdout": "",
+                "stderr": err.strip() or ("command exited %d" % rc),
+                "duration_ms": int((time.monotonic() - start) * 1000),
+            }
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": int((time.monotonic() - start) * 1000),
+        }
+    r = subprocess.run(spec["cmd"], capture_output=True, text=True,
+                       timeout=15, creationflags=_RUN_FLAGS)
+    return {
+        "ok": r.returncode == 0,
+        "exit_code": r.returncode,
+        "stdout": r.stdout,
+        "stderr": r.stderr,
+        "duration_ms": int((time.monotonic() - start) * 1000),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mock mode
+# ---------------------------------------------------------------------------
+
+MOCK_START = time.time()
+MOCK_BOOT_OFFSET = 3600 * 26 + 417  # pretend the box has been up ~26h already
+
+
+def mock_status():
+    now = time.time()
+    import math
+    base = 55.0 + 4.5 * math.sin(now / 97.0)
+    temp = round(base + random.uniform(-0.8, 0.8), 1)
+    load1 = round(random.uniform(0.2, 1.4), 2)
+    mem = {"total_mb": 16268, "used_mb": 7412, "available_mb": 8856}
+    _record_history(int(now), temp, load1, mem)  # sparklines exercisable in --mock
+    return {
+        "hostname": "couchside-win",
+        "time": int(now),
+        "uptime_s": int(now - MOCK_START + MOCK_BOOT_OFFSET),
+        "load": [load1,
+                 round(random.uniform(0.3, 1.1), 2),
+                 round(random.uniform(0.3, 0.9), 2)],
+        "cpu_temp_c": temp,
+        "mem": mem,
+        "disks": [
+            {"mount": "C:\\", "total_gb": 930.2, "used_gb": 412.4,
+             "free_gb": 517.8, "pct": 44},
+            {"mount": "D:\\", "total_gb": 1863.0, "used_gb": 1204.2,
+             "free_gb": 658.8, "pct": 65},
+        ],
+        "net": {"iface": "Intel(R) Ethernet Connection I219-V",
+                "mac": "de:ad:be:ef:00:02", "wired": True, "wol_armed": True},
+        "agent_version": VERSION,
+        "caps": CAPS,
+        "input_privilege": {"elevated": False, "uiaccess": False},
+        "history": _history_snapshot(),
+    }
+
+
+MOCK_UNIT_DESCS = {
+    "Audiosrv": "Windows Audio",
+}
+
+
+def mock_units():
+    units = []
+    for name, scope in WATCHLIST:
+        units.append({
+            "name": name,
+            "scope": scope,
+            "active": "active",
+            "sub": "running",
+            "description": MOCK_UNIT_DESCS.get(name, name),
+        })
+    return units
+
+
+MOCK_GENERIC_LOG = [
+    "The %(unit)s service entered the running state.",
+    "%(src)s: initialized",
+    "%(src)s: heartbeat ok",
+    "%(src)s: work item processed",
+    "%(src)s: idle",
+]
+
+MOCK_LOG_TEMPLATES = {
+    "Audiosrv": [
+        "The Windows Audio service entered the running state.",
+        "Audio endpoint enumeration completed.",
+        "Default render device changed.",
+        "Audio session created for process steam.exe.",
+    ],
+}
+
+
+def mock_journal(unit, scope, lines):
+    src = unit
+    templates = MOCK_LOG_TEMPLATES.get(
+        unit, [t % {"unit": unit, "src": src} for t in MOCK_GENERIC_LOG])
+    out = []
+    n = min(lines, 30)
+    t = time.time() - n * 47
+    host = "couchside-win"
+    for i in range(n):
+        msg = templates[i % len(templates)]
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t))
+        out.append("%s %s %s[%d]: %s" % (ts, host, src, 1200 + i, msg))
+        t += 47 + random.uniform(-20, 20)
+    return out
+
+
+def mock_action(action_id):
+    time.sleep(0.3)
+    spec = ACTIONS[action_id]
+    return {
+        "ok": True,
+        "exit_code": 0,
+        "stdout": "[mock] %s\n" % " ".join(spec["cmd"]),
+        "stderr": "",
+        "duration_ms": 300,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Launchers: custom (config) + auto-discovered Steam games
+#
+# Same routes and shapes as the Linux agent. Steam discovery reads the install
+# path from the registry (HKCU\Software\Valve\Steam SteamPath), then the same
+# libraryfolders.vdf / appmanifest_*.acf line-scans.
+# ---------------------------------------------------------------------------
+
+# Steam runtime/tool appids that ship in every library, never real games.
+STEAM_TOOL_APPIDS = frozenset({
+    "228980",   # Steamworks Common Redistributables
+})
+
+# appmanifest StateFlags bits meaning "an operation is in progress" (see the
+# Linux agent for the full rationale). A game appears in /api/downloads only
+# when one of these is set, or its byte counters prove an incomplete transfer.
+DL_UPDATE_RUNNING = 256
+DL_UPDATE_STARTED = 512
+DL_UPDATE_STOPPING = 1024
+DL_UNINSTALLING = 2048        # excluded: an uninstall is not a download
+DL_VALIDATING = 131072
+DL_PREALLOCATING = 524288
+DL_DOWNLOADING = 1048576
+DL_STAGING = 2097152
+DL_COMMITTING = 4194304
+DL_ACTIVE_OP = (DL_UPDATE_RUNNING | DL_UPDATE_STARTED | DL_UPDATE_STOPPING
+                | DL_VALIDATING | DL_PREALLOCATING | DL_DOWNLOADING
+                | DL_STAGING | DL_COMMITTING)
+
+
+def _steam_root():
+    """Steam install dir from the registry, or None (never raises)."""
+    if not IS_WINDOWS:
+        return None
+    for hive, subkey in ((winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+                         (winreg.HKEY_LOCAL_MACHINE,
+                          r"SOFTWARE\WOW6432Node\Valve\Steam")):
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value_name = ("SteamPath" if hive == winreg.HKEY_CURRENT_USER
+                              else "InstallPath")
+                path, _type = winreg.QueryValueEx(key, value_name)
+            path = os.path.normpath(str(path))
+            if os.path.isdir(os.path.join(path, "steamapps")):
+                return path
+        except OSError:
+            continue
+        except Exception:
+            continue
+    return None
+
+
+def _steam_exe(root):
+    """Path to steam.exe under the root, or None."""
+    exe = os.path.join(root, "steam.exe")
+    return exe if os.path.isfile(exe) else None
+
+
+# Steam Big Picture action, injected at load time when steam.exe exists (see
+# _inject_steam_action). The Windows analog of the Linux agent's built-in
+# SteamOS session-switch actions: one tap puts the box in couch/controller
+# mode. Uses the `-bigpicture` flag (validated on a real box): it reliably
+# COLD-STARTS a closed Steam directly into Big Picture — the couch use case.
+# The `steam://open/bigpicture` URL was tried and REJECTED: on a cold start
+# its handler brings Steam up in ordinary desktop mode (the URL is consumed
+# before the UI is ready), which is exactly the "nothing happens" symptom.
+# Trade-off: the flag does not flip an already-running desktop instance into
+# Big Picture, but the target scenario is an idle box with Steam closed.
+# Runs in the interactive session (the agent's scheduled task lives there),
+# so the UI lands on the actual screen.
+STEAM_BIGPICTURE_ACTION = {
+    "label": "Steam Big Picture",
+    "description": "Open Steam in Big Picture (couch) mode; starts Steam if it isn't running",
+    "danger": "low",
+    "cmd": [],  # filled with the discovered steam.exe path at inject time
+    "user_env": False,
+    "detached": True,
+}
+
+
+def _inject_steam_action(mock):
+    """Add the Steam Big Picture action when steam.exe is present. Called
+    after load_config so it applies whether config loaded or fell back to
+    defaults; a config-defined "steam-bigpicture" wins. In --mock it is
+    always injected (fake argv) so the app's Actions tab can be developed
+    off-box. Idempotent."""
+    global ACTIONS, ACTION_ORDER
+    if "steam-bigpicture" in ACTIONS:
+        return
+    if mock:
+        cmd = ["steam", "-bigpicture"]
+    else:
+        root = _steam_root()
+        exe = _steam_exe(root) if root else None
+        if exe is None:
+            return
+        cmd = [exe, "-bigpicture"]
+    spec = dict(STEAM_BIGPICTURE_ACTION)
+    spec["cmd"] = cmd
+    ACTIONS["steam-bigpicture"] = spec
+    if "steam-bigpicture" not in ACTION_ORDER:
+        ACTION_ORDER.append("steam-bigpicture")
+
+
+def _parse_vdf_paths(text):
+    """Extract library "path" values from a libraryfolders.vdf blob.
+    Line-scan, best-effort; never raises. VDF escapes backslashes ("C:\\\\...")
+    so unescape the doubled ones."""
+    paths = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith('"path"'):
+            continue
+        rest = s[len('"path"'):].lstrip()
+        if len(rest) >= 2 and rest[0] == '"':
+            end = rest.find('"', 1)
+            if end > 1:
+                paths.append(rest[1:end].replace("\\\\", "\\"))
+    return paths
+
+
+def _steam_libraries(root):
+    """The list of steamapps dirs to scan for this Steam root. Never raises."""
+    libs = []
+    seen = set()
+
+    def add(steamapps_dir):
+        try:
+            real = os.path.realpath(steamapps_dir)
+        except Exception:
+            real = steamapps_dir
+        key = os.path.normcase(real)
+        if key not in seen and os.path.isdir(steamapps_dir):
+            seen.add(key)
+            libs.append(steamapps_dir)
+
+    add(os.path.join(root, "steamapps"))
+    vdf = os.path.join(root, "steamapps", "libraryfolders.vdf")
+    try:
+        with open(vdf, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        for p in _parse_vdf_paths(text):
+            add(os.path.join(p, "steamapps"))
+    except OSError:
+        pass
+    except Exception:
+        pass
+    return libs
+
+
+def _parse_acf(text, keys=("appid", "name")):
+    """Extract the requested top-level quoted keys from an appmanifest .acf blob
+    (default "appid"/"name", so existing callers are unchanged). Never raises."""
+    out = {}
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith('"'):
+            continue
+        end = s.find('"', 1)
+        if end <= 1:
+            continue
+        key = s[1:end]
+        if key not in keys:
+            continue
+        rest = s[end + 1:].lstrip()
+        if len(rest) >= 2 and rest[0] == '"':
+            vend = rest.find('"', 1)
+            if vend > 0:
+                out[key] = rest[1:vend]
+    return out
+
+
+def _is_steam_tool(appid, name):
+    """True if this appmanifest is a Steam runtime/tool, not a real game."""
+    if appid in STEAM_TOOL_APPIDS:
+        return True
+    if name.startswith("Steamworks") or name.startswith("Proton"):
+        return True
+    return False
+
+
+def discover_steam_games():
+    """Auto-discovered Steam games as Launcher dicts, sorted by name.
+    Read-only, best-effort: any error yields an empty list."""
+    try:
+        root = _steam_root()
+        if root is None:
+            return []
+        games = {}
+        for steamapps in _steam_libraries(root):
+            try:
+                manifests = glob.glob(os.path.join(steamapps, "appmanifest_*.acf"))
+            except Exception:
+                continue
+            for mf in manifests:
+                try:
+                    with open(mf, "r", encoding="utf-8", errors="replace") as f:
+                        fields = _parse_acf(f.read())
+                except OSError:
+                    continue
+                except Exception:
+                    continue
+                appid = fields.get("appid")
+                name = fields.get("name")
+                if not appid or not appid.isdigit() or not name:
+                    continue
+                if _is_steam_tool(appid, name):
+                    continue
+                games.setdefault(appid, name)
+        launchers = [
+            {"id": "steam:%s" % appid, "label": name,
+             "kind": "steam", "appid": int(appid)}
+            for appid, name in games.items()
+        ]
+        launchers.sort(key=lambda l: (l["label"].lower(), l["appid"]))
+        return launchers
+    except Exception:
+        return []
+
+
+def _acf_int(s):
+    """Parse an ACF numeric string to int; 0 on missing/garbage (never raises)."""
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _download_state(flags):
+    """Map StateFlags to a coarse, user-facing operation label."""
+    if flags & (DL_DOWNLOADING | DL_PREALLOCATING):
+        return "downloading"
+    if flags & DL_VALIDATING:
+        return "validating"
+    if flags & (DL_STAGING | DL_COMMITTING):
+        return "finalizing"
+    if flags & (DL_UPDATE_RUNNING | DL_UPDATE_STARTED | DL_UPDATE_STOPPING):
+        return "updating"
+    # Incomplete bytes with no active-op bit: paused and queued look identical
+    # in the appmanifest, so report the more useful "paused".
+    return "paused"
+
+
+def steam_downloads():
+    """Steam apps with an in-progress download/update/validation, best-effort.
+
+    Read-only; any failure yields []. Walks the same libraries as
+    discover_steam_games() but reads StateFlags + byte counters per appmanifest.
+    Inclusion is an allowlist: an app is reported only when an active-op bit is
+    set OR its byte counters prove an incomplete transfer. Uninstalls (2048) and
+    fully-installed / stale pending-update entries with equal counters are
+    omitted, so the list reflects only what is actually moving.
+    """
+    try:
+        root = _steam_root()
+        if root is None:
+            return []
+        keys = ("appid", "name", "StateFlags", "BytesToDownload", "BytesDownloaded")
+        found = {}
+        for steamapps in _steam_libraries(root):
+            try:
+                manifests = glob.glob(os.path.join(steamapps, "appmanifest_*.acf"))
+            except Exception:
+                continue
+            for mf in manifests:
+                try:
+                    with open(mf, "r", encoding="utf-8", errors="replace") as f:
+                        fields = _parse_acf(f.read(), keys=keys)
+                except OSError:
+                    continue
+                except Exception:
+                    continue
+                appid = fields.get("appid")
+                name = fields.get("name")
+                if not appid or not appid.isdigit() or not name:
+                    continue
+                if _is_steam_tool(appid, name):
+                    continue
+                flags = _acf_int(fields.get("StateFlags"))
+                total = _acf_int(fields.get("BytesToDownload"))
+                done = _acf_int(fields.get("BytesDownloaded"))
+                if flags & DL_UNINSTALLING:
+                    continue
+                incomplete = total > 0 and done < total
+                if not (flags & DL_ACTIVE_OP) and not incomplete:
+                    continue
+                percent = (
+                    int(max(0, min(100, round(done * 100.0 / total)))) if total > 0 else 0
+                )
+                found[appid] = {
+                    "appid": int(appid),
+                    "name": name,
+                    "state": _download_state(flags),
+                    "bytes_total": total,
+                    "bytes_downloaded": done,
+                    "percent": percent,
+                }
+        order = {"downloading": 0, "paused": 1}
+        items = list(found.values())
+        items.sort(key=lambda d: (order.get(d["state"], 2), d["name"].lower(), d["appid"]))
+        return items
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Non-Steam game launchers (Epic, GOG Galaxy, Xbox / Game Pass).
+#
+# Same allowlist-by-lookup contract as Steam (CLAUDE.md §3): a client sends an
+# opaque launcher id; the agent RE-DISCOVERS the installed games (read-only),
+# matches the id against that fresh set, and rebuilds the launch argv from the
+# MATCHED RECORD's fields. The client string is never interpolated into a
+# command or URI — an unknown id yields None (the route 404s) and nothing runs.
+# Every discovery is best-effort and degrades closed: any error -> [].
+#
+# id schemes:  epic:<AppName>   gog:<numericGameId>   xbox:<AUMID>
+# Auto-discovered ids are not custom launchers, so they cannot be created or
+# deleted over the network (see _valid_launcher_id and the DELETE guard).
+# ---------------------------------------------------------------------------
+
+_AUTO_LAUNCHER_KINDS = frozenset({"steam", "epic", "gog", "xbox"})
+_ALNUM = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+_AUMID_CHARS = _ALNUM | frozenset("._-")
+
+
+def _alnum_ok(s):
+    """True if s is a non-empty run of ASCII letters/digits. Validates the Epic
+    id components before they are embedded in the launch URI, so nothing but
+    [A-Za-z0-9] can reach it (no ':', '/', '?', '&', spaces, quoting)."""
+    return bool(s) and all(c in _ALNUM for c in s)
+
+
+def _aumid_ok(s):
+    """True if s looks like a UWP AUMID: <PackageFamilyName>!<AppId>, each side a
+    non-empty run of [A-Za-z0-9._-] with exactly one '!'. Embedded in the
+    shell:AppsFolder path handed to explorer, so keep it strict."""
+    if s.count("!") != 1:
+        return False
+    left, right = s.split("!", 1)
+    return (bool(left) and bool(right)
+            and all(c in _AUMID_CHARS for c in left)
+            and all(c in _AUMID_CHARS for c in right))
+
+
+def _explorer_exe():
+    """Full path to explorer.exe, or None. explorer is the argv[0] that fires a
+    registered protocol URI (Epic) or a shell:AppsFolder app (Xbox) without a
+    shell — it hands the single argument to the registered handler."""
+    win = os.environ.get("WINDIR") or r"C:\Windows"
+    exe = os.path.join(win, "explorer.exe")
+    return exe if os.path.isfile(exe) else None
+
+
+# ---- Epic Games -----------------------------------------------------------
+def _epic_manifests_dir():
+    pd = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+    return os.path.join(pd, "Epic", "EpicGamesLauncher", "Data", "Manifests")
+
+
+def _epic_games_from_manifests(manifests):
+    """Pure transform: a list of parsed *.item dicts -> launcher records. Keeps
+    the launchable, installed GAMES (not the engine or marketplace plugins)
+    whose URI components are strictly alphanumeric. Deterministic order."""
+    out = {}
+    for m in manifests:
+        if not isinstance(m, dict):
+            continue
+        app = m.get("AppName")
+        ns = m.get("CatalogNamespace")
+        cid = m.get("CatalogItemId")
+        disp = m.get("DisplayName") or app
+        if not (app and ns and cid and disp):
+            continue
+        # These three are interpolated into the launch URI -> require strict
+        # alphanumeric. A game with an unexpected id shape is dropped, not
+        # sanitised (CLAUDE.md §3.6): it simply won't appear.
+        if not (_alnum_ok(app) and _alnum_ok(ns) and _alnum_ok(cid)):
+            continue
+        # Epic tags each app with categories; keep only games (drops "engines",
+        # "plugins", "software"). If the tag is absent, don't guess it out.
+        cats = m.get("AppCategories")
+        if isinstance(cats, list) and cats:
+            if not any(isinstance(c, str) and c.lower() == "games" for c in cats):
+                continue
+        out[app] = {"id": "epic:%s" % app, "label": disp, "kind": "epic",
+                    "namespace": ns, "catalog_item_id": cid, "app_name": app}
+    res = list(out.values())
+    res.sort(key=lambda l: (l["label"].lower(), l["id"]))
+    return res
+
+
+def discover_epic_games():
+    """Installed Epic games as launcher dicts, sorted by name. Read-only,
+    best-effort: any error yields []."""
+    if not IS_WINDOWS:
+        return []
+    try:
+        manifests = []
+        for it in glob.glob(os.path.join(_epic_manifests_dir(), "*.item")):
+            try:
+                with open(it, "r", encoding="utf-8", errors="replace") as f:
+                    manifests.append(json.load(f))
+            except (OSError, ValueError):
+                continue
+            except Exception:
+                continue
+        return _epic_games_from_manifests(manifests)
+    except Exception:
+        return []
+
+
+# ---- GOG Galaxy -----------------------------------------------------------
+def _reg_str(key, name):
+    """QueryValueEx as a stripped str, or None (never raises)."""
+    try:
+        val, _t = winreg.QueryValueEx(key, name)
+    except OSError:
+        return None
+    except Exception:
+        return None
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s or None
+
+
+def _gog_client_exe():
+    """Path to GalaxyClient.exe from the registry, or None."""
+    if not IS_WINDOWS:
+        return None
+    for sub in (r"SOFTWARE\WOW6432Node\GOG.com\GalaxyClient\paths",
+                r"SOFTWARE\GOG.com\GalaxyClient\paths"):
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub) as k:
+                d = _reg_str(k, "client")
+        except OSError:
+            continue
+        except Exception:
+            continue
+        if d:
+            exe = os.path.join(d, "GalaxyClient.exe")
+            if os.path.isfile(exe):
+                return exe
+    return None
+
+
+def _gog_games_from_rows(rows):
+    """Pure transform: raw registry rows [{gameID,gameName,path}] -> launcher
+    records. Keeps rows with a numeric id and a name. Deterministic order."""
+    out = {}
+    for r in rows:
+        gid = (r.get("gameID") or "").strip()
+        name = (r.get("gameName") or "").strip()
+        path = (r.get("path") or "").strip()
+        if not (gid.isdigit() and name):
+            continue
+        out[gid] = {"id": "gog:%s" % gid, "label": name, "kind": "gog",
+                    "game_id": gid, "path": path}
+    res = list(out.values())
+    res.sort(key=lambda l: (l["label"].lower(), l["id"]))
+    return res
+
+
+def _gog_registry_rows():
+    r"""Read HKLM\...\GOG.com\Games\<id> subkeys into raw dict rows. Windows
+    only; never raises."""
+    rows = []
+    for base in (r"SOFTWARE\WOW6432Node\GOG.com\Games",
+                 r"SOFTWARE\GOG.com\Games"):
+        try:
+            root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base)
+        except OSError:
+            continue
+        except Exception:
+            continue
+        with root:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    with winreg.OpenKey(root, sub) as gk:
+                        rows.append({
+                            "gameID": _reg_str(gk, "gameID") or sub,
+                            "gameName": _reg_str(gk, "gameName"),
+                            "path": _reg_str(gk, "path"),
+                        })
+                except OSError:
+                    continue
+                except Exception:
+                    continue
+        if rows:
+            break
+    return rows
+
+
+def discover_gog_games():
+    """Installed GOG Galaxy games as launcher dicts. Read-only, best-effort."""
+    if not IS_WINDOWS:
+        return []
+    try:
+        return _gog_games_from_rows(_gog_registry_rows())
+    except Exception:
+        return []
+
+
+# ---- Xbox / Game Pass -----------------------------------------------------
+# UWP games are found via Get-AppxPackage: a package is a GAME (not a random
+# Store app) when a MicrosoftGame.config sits in its InstallLocation. The AUMID
+# = "<PackageFamilyName>!<Application Id>"; launch is explorer shell:AppsFolder.
+_XBOX_TIMEOUT = 8
+_XBOX_TTL = 60.0
+_XBOX_CACHE = {"at": 0.0, "val": None}
+_XBOX_LOCK = threading.Lock()
+
+_XBOX_PS = r"""
+$ErrorActionPreference='SilentlyContinue'
+$out = New-Object System.Collections.ArrayList
+foreach ($p in Get-AppxPackage) {
+  if (-not $p.InstallLocation) { continue }
+  if (-not (Test-Path (Join-Path $p.InstallLocation 'MicrosoftGame.config'))) { continue }
+  $man = Get-AppxPackageManifest $p
+  $app = $man.Package.Applications.Application
+  if ($app -is [array]) { $app = $app[0] }
+  $id = $app.Id
+  if (-not $id) { continue }
+  $dn = $man.Package.Properties.DisplayName
+  if (-not $dn -or $dn -like 'ms-resource:*') { $dn = $p.Name }
+  [void]$out.Add([pscustomobject]@{ aumid = "$($p.PackageFamilyName)!$id"; name = "$dn" })
+}
+$out | ConvertTo-Json -Compress
+"""
+
+
+def _xbox_games_from_json(text):
+    """Pure transform: the Get-AppxPackage JSON blob -> launcher records. Accepts
+    either a single object or an array (ConvertTo-Json collapses one item).
+    Drops anything without a well-formed AUMID. Deterministic order."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    out = {}
+    for e in data:
+        if not isinstance(e, dict):
+            continue
+        aumid = (e.get("aumid") or "").strip()
+        name = (e.get("name") or "").strip()
+        if not _aumid_ok(aumid):
+            continue
+        out[aumid] = {"id": "xbox:%s" % aumid, "label": name or aumid,
+                      "kind": "xbox", "aumid": aumid}
+    res = list(out.values())
+    res.sort(key=lambda l: (l["label"].lower(), l["id"]))
+    return res
+
+
+def discover_xbox_games():
+    """Installed Xbox / Game Pass games as launcher dicts. Read-only,
+    best-effort. Cached for _XBOX_TTL because it shells out to PowerShell."""
+    if not IS_WINDOWS:
+        return []
+    now = time.monotonic()
+    with _XBOX_LOCK:
+        if _XBOX_CACHE["val"] is not None and now - _XBOX_CACHE["at"] < _XBOX_TTL:
+            return _XBOX_CACHE["val"]
+    try:
+        out = _run_powershell(_XBOX_PS, _XBOX_TIMEOUT)
+        games = _xbox_games_from_json(out) if out else []
+    except Exception:
+        games = []
+    with _XBOX_LOCK:
+        _XBOX_CACHE["at"] = time.monotonic()
+        _XBOX_CACHE["val"] = games
+    return games
+
+
+def _any_launcher_source():
+    """True if the box has any launcher the app can drive, via CHEAP checks only
+    (no game enumeration, no PowerShell): a configured custom launcher, a Steam
+    or GOG client install, or an Epic manifests dir holding >=1 installed game.
+    Backs the `launchers` capability so the Launch tab appears on Epic/GOG boxes,
+    not only Steam ones. Xbox-only boxes (Game Pass with no other launcher) are
+    intentionally NOT detected here — enumerating them needs the PowerShell
+    bridge, and blocking startup on it would hurt reachability; they surface once
+    any other launcher exists (or on the next restart). Never raises."""
+    try:
+        if LAUNCHERS:
+            return True
+        if _steam_root() is not None:
+            return True
+        if _gog_client_exe() is not None:
+            return True
+        if glob.glob(os.path.join(_epic_manifests_dir(), "*.item")):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def list_launchers():
+    """All launchers: configured custom launchers first, then auto-discovered
+    games from each store (Steam, Epic, GOG, Xbox)."""
+    customs = [
+        {"id": l["id"], "label": l["label"], "kind": "custom"}
+        for l in LAUNCHERS
+    ]
+    return (customs + discover_steam_games() + discover_epic_games()
+            + discover_gog_games() + discover_xbox_games())
+
+
+def _launcher_argv(launcher_id):
+    r"""Resolve a KNOWN launcher id to its argv, or None if unknown.
+
+    Every store branch RE-DISCOVERS (read-only) and matches launcher_id against
+    that fresh set, then rebuilds the argv from the matched RECORD — the client
+    string is never interpolated into the command. An id absent from discovery
+    yields None, the route 404s, and nothing runs.
+
+    steam:<appid> -> [steam.exe, "steam://rungameid/<appid>"]
+    epic:<name>   -> [explorer.exe, "com.epicgames.launcher://apps/<ns>:<cid>:<name>?action=launch"]
+    gog:<id>      -> [GalaxyClient.exe, "/command=runGame", "/gameId=<id>", "/path=<dir>"]
+    xbox:<aumid>  -> [explorer.exe, "shell:AppsFolder\<aumid>"]
+    custom:<slug> -> that launcher's stored cmd argv from config
+    """
+    if launcher_id.startswith("steam:"):
+        appid = launcher_id[len("steam:"):]
+        if not appid.isdigit():
+            return None
+        root = _steam_root()
+        exe = _steam_exe(root) if root else None
+        if exe is None:
+            return None
+        for game in discover_steam_games():
+            if game["id"] == launcher_id:
+                return [exe, "steam://rungameid/%s" % appid]
+        return None
+    if launcher_id.startswith("epic:"):
+        # Cheap shape pre-check; the real gate is membership in discovery below.
+        if not _alnum_ok(launcher_id[len("epic:"):]):
+            return None
+        exe = _explorer_exe()
+        if exe is None:
+            return None
+        for game in discover_epic_games():
+            if game["id"] == launcher_id:
+                uri = ("com.epicgames.launcher://apps/%s:%s:%s?action=launch"
+                       % (game["namespace"], game["catalog_item_id"],
+                          game["app_name"]))
+                return [exe, uri]
+        return None
+    if launcher_id.startswith("gog:"):
+        gid = launcher_id[len("gog:"):]
+        if not gid.isdigit():
+            return None
+        exe = _gog_client_exe()
+        if exe is None:
+            return None
+        for game in discover_gog_games():
+            if game["id"] == launcher_id:
+                argv = [exe, "/command=runGame", "/gameId=%s" % game["game_id"]]
+                if game.get("path"):
+                    argv.append("/path=%s" % game["path"])
+                return argv
+        return None
+    if launcher_id.startswith("xbox:"):
+        if not _aumid_ok(launcher_id[len("xbox:"):]):
+            return None
+        exe = _explorer_exe()
+        if exe is None:
+            return None
+        for game in discover_xbox_games():
+            if game["id"] == launcher_id:
+                return [exe, "shell:AppsFolder\\%s" % game["aumid"]]
+        return None
+    if _valid_launcher_id(launcher_id):
+        for l in LAUNCHERS:
+            if l["id"] == launcher_id:
+                return list(l["cmd"])
+    return None
+
+
+def real_launch(argv):
+    """Fire-and-forget launch into the user's session. The agent runs as the
+    logged-in user (scheduled task), so children land on the desktop directly;
+    detached so they outlive an agent restart."""
+    try:
+        subprocess.Popen(
+            argv, shell=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, creationflags=_DETACH_FLAGS,
+        )
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (e.__class__.__name__, e)}
+    return {"ok": True}
+
+
+def mock_launch(argv):
+    """--mock stand-in: log the argv, never execute anything real."""
+    print("[launch] %s" % " ".join(argv), flush=True)
+    return {"ok": True}
+
+
+_MOCK_DL_PCT = 0
+
+
+def mock_downloads():
+    """--mock stand-in: one advancing download (+7%/poll) and one paused entry."""
+    global _MOCK_DL_PCT
+    _MOCK_DL_PCT = (_MOCK_DL_PCT + 7) % 101
+    total = 42_000_000_000
+    done = int(total * _MOCK_DL_PCT / 100)
+    return [
+        {"appid": 1091500, "name": "Cyberpunk 2077", "state": "downloading",
+         "bytes_total": total, "bytes_downloaded": done, "percent": _MOCK_DL_PCT},
+        {"appid": 570, "name": "Dota 2", "state": "paused",
+         "bytes_total": 18_000_000_000, "bytes_downloaded": 5_400_000_000,
+         "percent": 30},
+    ]
+
+
+def _slugify_label(label):
+    """Lower-case, alnum/-/_ only slug of a label (for a launcher id)."""
+    out = []
+    for ch in label.lower():
+        if ch.isalnum() or ch in "-_":
+            out.append(ch)
+        elif ch in " \t":
+            out.append("-")
+    slug = "".join(out).strip("-_")
+    return slug or "launcher"
+
+
+def _new_launcher_id(label, existing_ids):
+    """Generate a unique, valid custom: id derived from label."""
+    base = _slugify_label(label)
+    candidate = "custom:%s" % base
+    n = 1
+    while candidate in existing_ids or not _valid_launcher_id(candidate):
+        n += 1
+        candidate = "custom:%s-%d" % (base, n)
+    return candidate
+
+
+def _write_config_launchers(new_launchers):
+    """Persist LAUNCHERS = new_launchers to CONFIG_PATH atomically (temp file +
+    os.replace). Serialized by CONFIG_LOCK. Raises on I/O failure."""
+    with CONFIG_LOCK:
+        raw = None
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            raw = None
+        if not isinstance(raw, dict):
+            raw = {
+                "units": [{"name": name, "scope": scope}
+                          for name, scope in WATCHLIST],
+                "actions": {
+                    aid: {"danger": spec["danger"], "cmd": list(spec["cmd"]),
+                          "label": spec["label"],
+                          "description": spec["description"],
+                          "user_env": spec["user_env"],
+                          "detached": spec["detached"]}
+                    for aid, spec in ACTIONS.items()
+                },
+            }
+        raw["launchers"] = [
+            {"id": l["id"], "label": l["label"], "cmd": list(l["cmd"])}
+            for l in new_launchers
+        ]
+        _write_config_atomic(raw)
+        global LAUNCHERS
+        LAUNCHERS = new_launchers
+
+
+def _write_config_atomic(raw):
+    """Persist <raw> to CONFIG_PATH via temp file + os.replace. THE writer.
+
+    Every config save funnels here. It used to be copy-pasted blocks that each
+    carried the same trap:
+
+        directory = os.path.dirname(CONFIG_PATH) or "."
+
+    `or "."` looks harmless. It is not: tempfile.mkstemp returns an ABSOLUTE
+    path, so "." resolves against the process CWD -- for a service, System32. A
+    CONFIG_PATH with no directory part therefore wrote its temp file there
+    instead of beside the config. The Linux agent shipped the same defect and it
+    bit a real user: pairing a TV on a Steam Deck (CWD "/", read-only root)
+    failed with "[Errno 30] Read-only file system: '/.couchside-config-il0oed3c'"
+    -- an errno naming a temp file nobody had heard of. load_config now abspath's
+    CONFIG_PATH; the check below turns a genuinely unwritable dir into a message
+    that says what to fix.
+
+    Raises ConfigError (a ValueError) on an unwritable dir, which the pairing and
+    launcher routes already handle -- so no caller gets an unhandled traceback."""
+    directory = os.path.dirname(CONFIG_PATH) or "."
+    # Create the config dir if it's missing: on Windows the agent may run with a
+    # literal --token and no pre-existing %ProgramData%\Couchside, and the first
+    # launcher POST would otherwise 500 on a FileNotFoundError.
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as e:
+        raise ConfigError("cannot create config dir %s (%s), so %s cannot be "
+                          "saved" % (directory, e, CONFIG_PATH))
+    if not os.access(directory, os.W_OK | os.X_OK):
+        raise ConfigError(
+            "config dir %s is not writable, so %s cannot be saved (read-only "
+            "location, or owned by another user). Reinstall, or grant the "
+            "agent's account write access to that directory."
+            % (directory, CONFIG_PATH))
+    fd, tmp = tempfile.mkstemp(prefix=".couchside-config-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(raw, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _config_read_for_write():
+    """Read CONFIG_PATH at the start of a read-modify-write (parity with the
+    Linux agent's helper of the same name).
+
+    Returns the parsed dict, or None when the file is ABSENT (a legitimate
+    first write). Raises ConfigError when the file EXISTS but is unreadable or
+    is not a JSON object. The writer below used to treat that like absent --
+    swallow the error and os.replace an EMPTY dict over the real file -- so one
+    momentarily-unreadable config (a save racing a read, a full disk) silently
+    wiped every launcher and Roku pairing. Refusing with a message is the
+    degrade-closed answer; the callers already map ConfigError to a 4xx/500."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise ConfigError("config %s exists but is unreadable (%s); refusing to "
+                          "overwrite it" % (CONFIG_PATH, e))
+    if not isinstance(raw, dict):
+        raise ConfigError("config %s is not a JSON object; refusing to overwrite "
+                          "it" % CONFIG_PATH)
+    return raw
+
+
+def _config_set_field(field, value):
+    """Read config.json, set one top-level field, and write it back atomically
+    (temp file + os.replace). The CALLER must hold CONFIG_LOCK. Raises on I/O
+    failure, and ConfigError (never overwrites) when the config exists but is
+    unreadable -- see _config_read_for_write. Used to persist a Roku add
+    without disturbing other config."""
+    raw = _config_read_for_write()
+    if raw is None:
+        raw = {}
+    raw[field] = value
+    _write_config_atomic(raw)
+
+
+def add_launcher(label, cmd):
+    """Validate + persist a new custom launcher; return its Launcher dict.
+    Raises ConfigError on invalid input (mapped to HTTP 400 by the caller)."""
+    if not isinstance(label, str) or not label.strip() or len(label) > MAX_LABEL_LEN:
+        raise ConfigError("label must be a non-empty string")
+    if not _valid_cmd(cmd):
+        raise ConfigError("cmd must be a non-empty list of non-empty strings")
+    if len(LAUNCHERS) >= MAX_LAUNCHERS:
+        raise ConfigError("too many launchers (max %d)" % MAX_LAUNCHERS)
+    label = label.strip()
+    existing = {l["id"] for l in LAUNCHERS}
+    lid = _new_launcher_id(label, existing)
+    new = list(LAUNCHERS) + [{"id": lid, "label": label, "cmd": list(cmd)}]
+    _write_config_launchers(new)
+    return {"id": lid, "label": label, "kind": "custom"}
+
+
+def delete_launcher(launcher_id):
+    """Remove a custom launcher by id; persist. Returns True, or False if the
+    id is a valid custom id that isn't present. Raises on persist failure."""
+    if not any(l["id"] == launcher_id for l in LAUNCHERS):
+        return False
+    new = [l for l in LAUNCHERS if l["id"] != launcher_id]
+    _write_config_launchers(new)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# SendInput plumbing: virtual mouse / keyboard / media keys (no driver needed)
+# ---------------------------------------------------------------------------
+
+INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
+
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
+MOUSEEVENTF_WHEEL = 0x0800
+WHEEL_DELTA = 120
+
+VK_BACK, VK_TAB, VK_RETURN, VK_SHIFT, VK_ESCAPE, VK_SPACE = (
+    0x08, 0x09, 0x0D, 0x10, 0x1B, 0x20)
+VK_END, VK_HOME = 0x23, 0x24
+VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN = 0x25, 0x26, 0x27, 0x28
+VK_VOLUME_MUTE, VK_VOLUME_DOWN, VK_VOLUME_UP = 0xAD, 0xAE, 0xAF
+# Modifier + Windows-key virtual codes, for the system-shortcut chords below.
+VK_LWIN, VK_LCONTROL, VK_LMENU = 0x5B, 0xA2, 0xA4
+VK_L = 0x4C  # letter L, for Win+L (lock)
+
+# E0-prefixed extended keys: SendInput needs KEYEVENTF_EXTENDEDKEY or their
+# scan codes alias onto the numpad for raw-input consumers. LWIN is E0-prefixed
+# too; without the flag Win+L / the Start menu can misfire.
+EXTENDED_VKS = frozenset((VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, VK_HOME, VK_END,
+                          VK_VOLUME_MUTE, VK_VOLUME_DOWN, VK_VOLUME_UP, VK_LWIN))
+
+# named special key -> virtual-key code (same protocol names as Linux)
+SPECIAL_KEYS = {
+    "backspace": VK_BACK,
+    "enter": VK_RETURN,
+    "tab": VK_TAB,
+    "esc": VK_ESCAPE,
+    "space": VK_SPACE,
+    "up": VK_UP,
+    "down": VK_DOWN,
+    "left": VK_LEFT,
+    "right": VK_RIGHT,
+    "home": VK_HOME,
+    "end": VK_END,
+}
+
+# System-shortcut chords (Windows desktop). One protocol name -> an ordered VK
+# sequence pressed down in order then released in reverse (see Keyboard.emit).
+# Ctrl+Alt+Del is deliberately absent: it is the Secure Attention Sequence, which
+# SendInput cannot generate by design (only the kernel/SendSAS can). These are
+# all plain injectable keystrokes.
+KEY_CHORDS = {
+    "win": (VK_LWIN,),                                # Start menu
+    "alt-tab": (VK_LMENU, VK_TAB),                    # switch window
+    "lock": (VK_LWIN, VK_L),                          # Win+L, lock the session
+    "taskmgr": (VK_LCONTROL, VK_SHIFT, VK_ESCAPE),    # Ctrl+Shift+Esc
+}
+
+if IS_WINDOWS:
+    ULONG_PTR = ctypes.c_size_t
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                    ("mouseData", ctypes.c_uint32),
+                    ("dwFlags", ctypes.c_uint32),
+                    ("time", ctypes.c_uint32),
+                    ("dwExtraInfo", ULONG_PTR)]
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", ctypes.c_uint16), ("wScan", ctypes.c_uint16),
+                    ("dwFlags", ctypes.c_uint32),
+                    ("time", ctypes.c_uint32),
+                    ("dwExtraInfo", ULONG_PTR)]
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", ctypes.c_uint32),
+                    ("wParamL", ctypes.c_uint16),
+                    ("wParamH", ctypes.c_uint16)]
+
+    class _INPUT_UNION(ctypes.Union):
+        _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT),
+                    ("hi", _HARDWAREINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_uint32), ("u", _INPUT_UNION)]
+
+    # Pin the signature: without argtypes ctypes defaults every arg to c_int,
+    # which truncates the _INPUT array pointer on 64-bit Windows.
+    _user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+    _user32.SendInput.restype = wintypes.UINT
+
+    # WTS session-state API, for input-reachability detection (see
+    # _session_is_active). argtypes pinned so the byref pointers aren't truncated
+    # to c_int on 64-bit Windows (same hazard as SendInput above).
+    _wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
+    _wtsapi32.WTSQuerySessionInformationW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
+    _wtsapi32.WTSQuerySessionInformationW.restype = wintypes.BOOL
+    _wtsapi32.WTSFreeMemory.argtypes = [ctypes.c_void_p]
+
+    def _send_inputs(inputs):
+        """SendInput a list of _INPUT; raises OSError when Windows swallows
+        them (secure desktop / UIPI / wrong session), so callers can report
+        failure. Callers must treat this as NON-fatal — see _gamepad_message."""
+        if not inputs:
+            return
+        n = len(inputs)
+        arr = (_INPUT * n)(*inputs)
+        sent = _user32.SendInput(n, arr, ctypes.sizeof(_INPUT))
+        if sent != n:
+            raise OSError("SendInput injected %d/%d events (error %d)"
+                          % (sent, n, ctypes.get_last_error()))
+
+    def _key_input(vk, down):
+        inp = _INPUT()
+        inp.type = INPUT_KEYBOARD
+        inp.u.ki.wVk = vk
+        # Real scan code alongside the VK: some games read scan codes only.
+        inp.u.ki.wScan = _user32.MapVirtualKeyW(vk, 0)  # MAPVK_VK_TO_VSC
+        flags = 0 if down else KEYEVENTF_KEYUP
+        # Arrows/Home/End/volume are E0-prefixed extended keys; without this
+        # flag their scan codes read as NUMPAD keys to raw-input consumers
+        # (games), turning "left" into numpad-4.
+        if vk in EXTENDED_VKS:
+            flags |= KEYEVENTF_EXTENDEDKEY
+        inp.u.ki.dwFlags = flags
+        return inp
+
+    def _unicode_key_inputs(ch):
+        """Down+up KEYEVENTF_UNICODE events for one character, independent of
+        the active keyboard layout (AltGr chars, any script). Non-BMP chars
+        inject as their UTF-16 surrogate pair."""
+        inputs = []
+        units = ch.encode("utf-16-le")
+        for i in range(0, len(units), 2):
+            code = int.from_bytes(units[i:i + 2], "little")
+            for up in (False, True):
+                inp = _INPUT()
+                inp.type = INPUT_KEYBOARD
+                inp.u.ki.wVk = 0
+                inp.u.ki.wScan = code
+                inp.u.ki.dwFlags = (KEYEVENTF_UNICODE |
+                                    (KEYEVENTF_KEYUP if up else 0))
+                inputs.append(inp)
+        return inputs
+
+    def _mouse_input(dx=0, dy=0, data=0, flags=0):
+        inp = _INPUT()
+        inp.type = INPUT_MOUSE
+        inp.u.mi.dx = dx
+        inp.u.mi.dy = dy
+        inp.u.mi.mouseData = data
+        inp.u.mi.dwFlags = flags
+        return inp
+
+
+# Input reachability. SendInput does NOT raise when the agent's session is
+# DISCONNECTED (you closed/switched away from the RDP or console session it
+# launched in): it "succeeds" and the events are silently dropped, so the cursor
+# just freezes with no error for _send_inputs to catch — the classic "trackpad
+# moves for a bit then quits". Detect that proactively so the WS handler raises
+# the same non-fatal "Input paused" hint (and auto-resumes) instead of a mystery
+# stall. The lock/secure desktop already surfaces via SendInput's OSError; a
+# focused elevated window (UIPI) is a separate, unavoidable non-elevated limit.
+_INPUT_REACH_CACHE = {"t": -1.0e9, "ok": True}
+
+
+def _session_is_active():
+    """True when THIS agent's session is the connected/active one (WTSConnectState
+    == WTSActive). False when it is Disconnected/idle, i.e. input injected here
+    goes to a session nobody is looking at. Fails OPEN on any error so the check
+    can never itself block working input."""
+    if not IS_WINDOWS:
+        return True
+    buf = ctypes.c_void_p()
+    n = wintypes.DWORD()
+    try:
+        # WTS_CURRENT_SERVER_HANDLE=None, WTS_CURRENT_SESSION=-1, WTSConnectState=8.
+        if not _wtsapi32.WTSQuerySessionInformationW(
+                None, 0xFFFFFFFF, 8, ctypes.byref(buf), ctypes.byref(n)) \
+                or not buf.value:
+            return True
+        state = ctypes.cast(buf, ctypes.POINTER(ctypes.c_int)).contents.value
+        return state == 0  # WTS_CONNECTSTATE_CLASS.WTSActive
+    except Exception:
+        return True
+    finally:
+        if buf.value:
+            try:
+                _wtsapi32.WTSFreeMemory(buf)
+            except Exception:
+                pass
+
+
+def _input_reachable():
+    """Cached (~0.5s) wrapper around _session_is_active so a stream of mouse
+    frames doesn't hammer the WTS API. True on non-Windows and on any doubt."""
+    if not IS_WINDOWS:
+        return True
+    now = time.monotonic()
+    if now - _INPUT_REACH_CACHE["t"] < 0.5:
+        return _INPUT_REACH_CACHE["ok"]
+    ok = _session_is_active()
+    _INPUT_REACH_CACHE["t"] = now
+    _INPUT_REACH_CACHE["ok"] = ok
+    return ok
+
+
+# This process's input privilege — WHY the mouse "stops when I alt-tab to an
+# admin app". A NON-elevated process cannot SendInput into a foreground window
+# running at HIGHER integrity (Windows UIPI); it works on same/lower-integrity
+# windows (incl. the agent's own console) and is silently dropped on elevated
+# ones (games+anticheat, admin terminals, Task Manager, installers). Two escapes:
+#   elevated  — the agent runs as admin (install.ps1 -Elevated); reaches every
+#               window, bigger blast radius (a LAN token drives admin app windows).
+#   uiaccess  — the UIAccess token flag: a SIGNED, secure-located (Program Files),
+#               uiAccess=true exe reaches elevated windows WITHOUT being admin.
+#               Requires the signed-exe build (roadmap); a plain pythonw script
+#               can never have it. Neither can drive the UAC consent secure desktop.
+# Fixed for the process lifetime, so computed once. Reported additively on
+# /api/status as `input_privilege` so the app can explain the limit + the fix.
+_TOKEN_QUERY = 0x0008
+_TokenElevation = 20   # TOKEN_INFORMATION_CLASS.TokenElevation
+_TokenUIAccess = 26    # TOKEN_INFORMATION_CLASS.TokenUIAccess
+_PRIVILEGE_CACHE = None
+
+
+def _process_privilege():
+    """{'elevated': bool, 'uiaccess': bool} for THIS process token. Never raises;
+    all-False off Windows and on any probe failure (degrade closed)."""
+    global _PRIVILEGE_CACHE
+    if _PRIVILEGE_CACHE is not None:
+        return _PRIVILEGE_CACHE
+    result = {"elevated": False, "uiaccess": False}
+    if IS_WINDOWS and _kernel32 is not None:
+        try:
+            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+            # argtypes/restype are LOAD-BEARING on 64-bit Windows: without them
+            # ctypes assumes c_int (32-bit) for every arg + the return, which
+            # TRUNCATES the GetCurrentProcess pseudo-handle and the token/pointer
+            # handles to 32 bits. The calls then fail and this degrades-closed to
+            # all-False — i.e. the cap silently reports "not elevated" on an
+            # elevated box (caught only on real hardware, 2026-09-17).
+            _kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            advapi32.OpenProcessToken.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_void_p)]
+            advapi32.OpenProcessToken.restype = ctypes.c_int
+            advapi32.GetTokenInformation.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+            advapi32.GetTokenInformation.restype = ctypes.c_int
+            htok = ctypes.c_void_p()
+            if advapi32.OpenProcessToken(_kernel32.GetCurrentProcess(),
+                                         _TOKEN_QUERY, ctypes.byref(htok)):
+                try:
+                    def _q(info_class):
+                        val = ctypes.c_uint32(0)
+                        ret = ctypes.c_uint32(0)
+                        ok = advapi32.GetTokenInformation(
+                            htok, info_class, ctypes.byref(val), 4,
+                            ctypes.byref(ret))
+                        return bool(ok and val.value)
+                    result = {"elevated": _q(_TokenElevation),
+                              "uiaccess": _q(_TokenUIAccess)}
+                finally:
+                    _kernel32.CloseHandle(htok)
+        except Exception:
+            result = {"elevated": False, "uiaccess": False}
+    _PRIVILEGE_CACHE = result
+    return result
+
+
+def _foreground_is_elevated():
+    """Read the foreground process's elevation; None when it cannot be queried.
+
+    No window activation or privilege changes. Pin every handle signature for
+    64-bit Windows, and close both query handles on all paths.
+    """
+    if not IS_WINDOWS or _kernel32 is None:
+        return None
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p,
+                                                   ctypes.POINTER(ctypes.c_uint32)]
+        _kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                          ctypes.c_uint32]
+        _kernel32.OpenProcess.restype = ctypes.c_void_p
+        _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        advapi32.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                              ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.GetTokenInformation.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                 ctypes.c_void_p, ctypes.c_uint32,
+                                                 ctypes.POINTER(ctypes.c_uint32)]
+        pid = ctypes.c_uint32()
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None  # lock/UAC secure desktop, or no foreground window
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        process = _kernel32.OpenProcess(0x1000, False, pid.value)
+        if not process:
+            return None
+        try:
+            token = ctypes.c_void_p()
+            if not advapi32.OpenProcessToken(process, _TOKEN_QUERY, ctypes.byref(token)):
+                return None
+            try:
+                value, length = ctypes.c_uint32(), ctypes.c_uint32()
+                if advapi32.GetTokenInformation(token, _TokenElevation,
+                        ctypes.byref(value), 4, ctypes.byref(length)):
+                    return bool(value.value)
+                return None
+            finally:
+                _kernel32.CloseHandle(token)
+        finally:
+            _kernel32.CloseHandle(process)
+    except Exception:
+        return None
+
+
+def _input_blocked_message():
+    if not _input_reachable():
+        return ("Windows session inactive. Sign in on the PC; "
+                "disconnect Remote Desktop.")
+    privilege = _process_privilege()
+    if (not privilege["elevated"] and not privilege["uiaccess"]
+            and _foreground_is_elevated() is True):
+        return ("Administrator app blocks input. Switch to a normal app "
+                "on the PC.")
+    return ("Input paused. Check Windows for a lock screen or security prompt.")
+
+
+# ---------------------------------------------------------------------------
+# Box mute state via Core Audio (ctypes COM, read-only). Best-effort: every
+# failure returns None, which the API contract tolerates (muted: bool|null).
+# ---------------------------------------------------------------------------
+
+if IS_WINDOWS:
+    _ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+        @classmethod
+        def from_str(cls, s):
+            g = cls()
+            _ole32.CLSIDFromString(ctypes.c_wchar_p(s), ctypes.byref(g))
+            return g
+
+    _CLSID_MMDeviceEnumerator = "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+    _IID_IMMDeviceEnumerator = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+    _IID_IAudioEndpointVolume = "{5CDF2C82-841E-4546-9722-0CF74078229A}"
+    _CLSCTX_ALL = 23
+    _eRender, _eMultimedia = 0, 1
+
+    def _com_method(obj, index, *argtypes):
+        """Bound callable for vtable slot `index` on COM interface pointer
+        `obj`. Explicit argtypes (the implicit `this` is prepended here), so
+        ctypes marshals byrefs/ints correctly."""
+        vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+        fn_ptr = vtbl.contents[index]
+        proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)
+        fn = proto(fn_ptr)
+        return lambda *args: fn(obj, *args)
+
+    def _com_release(obj):
+        try:
+            _com_method(obj, 2)()  # IUnknown::Release
+        except Exception:
+            pass
+
+    # CoInitializeEx return values that mean THIS call took ownership and the
+    # thread must balance with CoUninitialize: S_OK (0) and S_FALSE (1, already
+    # inited in the SAME mode). RPC_E_CHANGED_MODE means another init on this
+    # thread owns COM in a different mode — do NOT uninit then.
+    _RPC_E_CHANGED_MODE = 0x80010106
+
+    def _with_endpoint_volume(fn):
+        """Acquire the default-render-endpoint IAudioEndpointVolume, invoke
+        fn(volume_ptr_value), and tear everything down: releases every COM
+        object AND balances CoInitializeEx with CoUninitialize (the missing
+        CoUninitialize was leaking a COM apartment refcount on every /api/tv
+        poll). Returns fn's result, or None on any failure. Never raises."""
+        enumerator = ctypes.c_void_p()
+        device = ctypes.c_void_p()
+        volume = ctypes.c_void_p()
+        need_uninit = False
+        try:
+            hr = _ole32.CoInitializeEx(None, 0)  # COINIT_MULTITHREADED
+            # Uninit only when we actually initialized (S_OK/S_FALSE), never on
+            # RPC_E_CHANGED_MODE or any hard failure.
+            need_uninit = hr in (0, 1)
+            if hr not in (0, 1) and hr != _RPC_E_CHANGED_MODE:
+                return None
+            clsid = _GUID.from_str(_CLSID_MMDeviceEnumerator)
+            iid_enum = _GUID.from_str(_IID_IMMDeviceEnumerator)
+            hr = _ole32.CoCreateInstance(
+                ctypes.byref(clsid), None, _CLSCTX_ALL,
+                ctypes.byref(iid_enum), ctypes.byref(enumerator))
+            if hr != 0 or not enumerator:
+                return None
+            # IMMDeviceEnumerator::GetDefaultAudioEndpoint (vtable slot 4)
+            get_default = _com_method(
+                enumerator.value, 4, ctypes.c_uint32, ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_void_p))
+            hr = get_default(_eRender, _eMultimedia, ctypes.byref(device))
+            if hr != 0 or not device:
+                return None
+            # IMMDevice::Activate (slot 3)
+            iid_vol = _GUID.from_str(_IID_IAudioEndpointVolume)
+            activate = _com_method(
+                device.value, 3, ctypes.POINTER(_GUID), ctypes.c_uint32,
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
+            hr = activate(ctypes.byref(iid_vol), _CLSCTX_ALL, None,
+                          ctypes.byref(volume))
+            if hr != 0 or not volume:
+                return None
+            return fn(volume.value)
+        except Exception:
+            return None
+        finally:
+            for obj in (volume, device, enumerator):
+                if obj:
+                    _com_release(obj.value)
+            if need_uninit:
+                try:
+                    _ole32.CoUninitialize()
+                except Exception:
+                    pass
+
+    def read_box_muted():
+        """Current default-render-endpoint mute (True/False), or None."""
+        def _get(vol):
+            # IAudioEndpointVolume::GetMute (slot 15)
+            muted = ctypes.c_int(0)
+            get_mute = _com_method(vol, 15, ctypes.POINTER(ctypes.c_int))
+            if get_mute(ctypes.byref(muted)) != 0:
+                return None
+            return bool(muted.value)
+        return _with_endpoint_volume(_get)
+
+    def read_box_volume():
+        """Current default-render-endpoint scalar volume as a float 0.0-1.0,
+        or None. Uses IAudioEndpointVolume::GetMasterVolumeLevelScalar
+        (vtable slot 9): the same 0..1 taper the Windows volume slider uses,
+        so it lines up with the app's percentage."""
+        def _get(vol):
+            level = ctypes.c_float(0.0)
+            get_scalar = _com_method(vol, 9, ctypes.POINTER(ctypes.c_float))
+            if get_scalar(ctypes.byref(level)) != 0:
+                return None
+            return max(0.0, min(1.0, float(level.value)))
+        return _with_endpoint_volume(_get)
+
+    def set_box_volume_scalar(level01):
+        """Set the endpoint scalar volume to level01 (0.0-1.0) via
+        IAudioEndpointVolume::SetMasterVolumeLevelScalar (vtable slot 7).
+        Returns True on success. A positive level also clears mute (slot 14
+        SetMute) so the change is audible, matching the Linux soft_set_volume
+        unmute-on-raise behaviour."""
+        lvl = max(0.0, min(1.0, float(level01)))
+        def _set(vol):
+            set_scalar = _com_method(vol, 7, ctypes.c_float, ctypes.c_void_p)
+            if set_scalar(ctypes.c_float(lvl), None) != 0:
+                return False
+            if lvl > 0.0:
+                # SetMute(FALSE, NULL) — best-effort; ignore its hr.
+                set_mute = _com_method(vol, 14, ctypes.c_int, ctypes.c_void_p)
+                set_mute(0, None)
+            return True
+        return bool(_with_endpoint_volume(_set))
+else:
+    def read_box_muted():
+        return None
+
+    def read_box_volume():
+        return None
+
+    def set_box_volume_scalar(level01):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# TV control (probe-and-appear): panel (RS-232 over COMn) + soft (volume keys)
+#
+# Same unified op set and dispatch rules as the Linux agent, minus CEC (no
+# standard CEC stack on Windows). Windows binds VK_VOLUME_MUTE natively with
+# a real mute OSD, so mute is a plain media-key tap here (no volume-to-zero
+# dance like gamescope needs).
+# ---------------------------------------------------------------------------
+
+TV_OPS = ("power_on", "power_off", "volume_up", "volume_down", "mute")
+SOFT_OPS = ("volume_up", "volume_down", "mute")
+_POWER_OPS = ("power_on", "power_off")
+
+_SOFT_VKS = {
+    "volume_up": VK_VOLUME_UP,
+    "volume_down": VK_VOLUME_DOWN,
+    "mute": VK_VOLUME_MUTE,
+}
+
+PANEL = None  # {"device","baud","protocol"} when active
+SOFT = None   # {"adapter": ...} when SendInput volume keys are available
+
+
+# ---- panel backend: Newline TruTouch RS-232 frames over a COM port ---------
+
+_PANEL_KEYCODES = {
+    "power_on": 0x00,
+    "power_off": 0x01,
+    "mute": 0x02,
+    "volume_down": 0x17,
+    "volume_up": 0x18,
+}
+
+
+def _panel_frame(op):
+    code = _PANEL_KEYCODES[op]
+    return bytes([0x7F, 0x08, 0x99, 0xA2, 0xB3, 0xC4, 0x02, 0xFF, 0x01,
+                  code, 0xCF])
+
+
+def _hexstr(b):
+    return " ".join("%02X" % x for x in b)
+
+
+if IS_WINDOWS:
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class _DCB(ctypes.Structure):
+        _fields_ = [
+            ("DCBlength", ctypes.c_uint32), ("BaudRate", ctypes.c_uint32),
+            ("fFlags", ctypes.c_uint32),  # packed bitfields, cleared to 0
+            ("wReserved", ctypes.c_uint16), ("XonLim", ctypes.c_uint16),
+            ("XoffLim", ctypes.c_uint16), ("ByteSize", ctypes.c_ubyte),
+            ("Parity", ctypes.c_ubyte), ("StopBits", ctypes.c_ubyte),
+            ("XonChar", ctypes.c_char), ("XoffChar", ctypes.c_char),
+            ("ErrorChar", ctypes.c_char), ("EofChar", ctypes.c_char),
+            ("EvtChar", ctypes.c_char), ("wReserved1", ctypes.c_uint16),
+        ]
+
+    class _COMMTIMEOUTS(ctypes.Structure):
+        _fields_ = [
+            ("ReadIntervalTimeout", ctypes.c_uint32),
+            ("ReadTotalTimeoutMultiplier", ctypes.c_uint32),
+            ("ReadTotalTimeoutConstant", ctypes.c_uint32),
+            ("WriteTotalTimeoutMultiplier", ctypes.c_uint32),
+            ("WriteTotalTimeoutConstant", ctypes.c_uint32),
+        ]
+
+    def _serial_send(device, baud, frame, expect_reply=True, timeout=1.0):
+        """Open \\\\.\\COMn raw at <baud> 8N1, write <frame>, read back a short
+        reply (best-effort). Returns the reply bytes."""
+        path = "\\\\.\\" + device
+        # restype must be c_void_p: the default c_int truncates the 64-bit
+        # HANDLE and turns INVALID_HANDLE_VALUE into a plain -1 that would
+        # never match the sentinel below.
+        _kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = _kernel32.CreateFileW(
+            ctypes.c_wchar_p(path), ctypes.c_uint32(GENERIC_READ | GENERIC_WRITE),
+            0, None, OPEN_EXISTING, 0, None)
+        if handle == INVALID_HANDLE_VALUE or handle is None:
+            raise OSError("cannot open %s (error %d)"
+                          % (device, ctypes.get_last_error()))
+        handle = ctypes.c_void_p(handle)  # keep full 64-bit width in calls
+        try:
+            dcb = _DCB()
+            dcb.DCBlength = ctypes.sizeof(dcb)
+            if not _kernel32.GetCommState(handle, ctypes.byref(dcb)):
+                raise OSError("GetCommState failed (error %d)"
+                              % ctypes.get_last_error())
+            dcb.BaudRate = baud
+            dcb.ByteSize = 8
+            dcb.Parity = 0     # NOPARITY
+            dcb.StopBits = 0   # ONESTOPBIT
+            # fBinary must stay set (bit 0); everything else (parity check,
+            # CTS/DSR flow control, XON/XOFF, DTR/RTS control) cleared = raw.
+            dcb.fFlags = 0x00000001
+            if not _kernel32.SetCommState(handle, ctypes.byref(dcb)):
+                raise OSError("SetCommState failed (error %d)"
+                              % ctypes.get_last_error())
+            # MAXDWORD/MAXDWORD/constant: ReadFile returns as soon as ANY
+            # bytes are available (or after `constant` ms with none), instead
+            # of stalling the full timeout waiting to fill the buffer. The
+            # panel echo is 12 bytes and arrives in milliseconds; the plain
+            # total-timeout form would block every TV op ~1s.
+            MAXDWORD = 0xFFFFFFFF
+            to = _COMMTIMEOUTS(MAXDWORD, MAXDWORD, int(timeout * 1000),
+                               0, int(timeout * 1000))
+            _kernel32.SetCommTimeouts(handle, ctypes.byref(to))
+            written = ctypes.c_uint32(0)
+            if not _kernel32.WriteFile(handle, frame, len(frame),
+                                       ctypes.byref(written), None):
+                raise OSError("WriteFile failed (error %d)"
+                              % ctypes.get_last_error())
+            if written.value != len(frame):
+                raise OSError("short serial write (%d/%d)"
+                              % (written.value, len(frame)))
+            _kernel32.FlushFileBuffers(handle)
+            reply = b""
+            if expect_reply:
+                # Accumulate until the 12-byte Newline echo is in (or the
+                # deadline passes); each ReadFile returns per the interval
+                # timeouts above, so a quiet line exits early.
+                deadline = time.monotonic() + timeout
+                buf = ctypes.create_string_buffer(64)
+                nread = ctypes.c_uint32(0)
+                while len(reply) < 12 and time.monotonic() < deadline:
+                    if not _kernel32.ReadFile(handle, buf, 64,
+                                              ctypes.byref(nread), None):
+                        break
+                    if nread.value == 0:
+                        break  # timed out with nothing more coming
+                    reply += buf.raw[:nread.value]
+            return reply
+        finally:
+            _kernel32.CloseHandle(handle)
+else:
+    def _serial_send(device, baud, frame, expect_reply=True, timeout=1.0):
+        raise OSError("serial panel control requires Windows")
+
+
+def _com_port_exists(device):
+    """True when COMn is present (QueryDosDeviceW resolves it)."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        return _kernel32.QueryDosDeviceW(ctypes.c_wchar_p(device), buf, 1024) != 0
+    except Exception:
+        return False
+
+
+def set_panel(mock):
+    """Populate the panel descriptor. In --mock a fake serial device is always
+    reported so the TV strip can be developed without hardware. Real mode:
+    active only when config.json named a COM port that exists."""
+    global PANEL
+    if mock:
+        PANEL = {"device": "mock", "baud": 19200, "protocol": "newline"}
+    elif CONFIG_PANEL and _com_port_exists(CONFIG_PANEL["device"]):
+        PANEL = dict(CONFIG_PANEL)
+    else:
+        PANEL = None
+
+
+def panel_available():
+    return PANEL is not None
+
+
+def real_panel(op):
+    """Send a Newline command frame over the configured COM port. Success
+    means the frame was written; the reply, if any, is echoed in stdout."""
+    start = time.monotonic()
+    frame = _panel_frame(op)
+    try:
+        reply = _serial_send(PANEL["device"], PANEL["baud"], frame)
+    except Exception as e:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "%s: %s" % (e.__class__.__name__, e),
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    stdout = "sent %s | reply %s" % (
+        _hexstr(frame), _hexstr(reply) if reply else "(none)")
+    return {"ok": True, "exit_code": 0, "stdout": stdout, "stderr": "",
+            "duration_ms": int((time.monotonic() - start) * 1000)}
+
+
+def mock_panel(op):
+    """--mock stand-in: log the frame that would go out, never open a device."""
+    time.sleep(0.1)
+    frame = _panel_frame(op)
+    print("[panel] %s -> %s" % (op, _hexstr(frame)), flush=True)
+    return {"ok": True, "exit_code": 0,
+            "stdout": "[mock panel] %s -> %s\n" % (op, _hexstr(frame)),
+            "stderr": "", "duration_ms": 100}
+
+
+# ---- soft backend (box volume via the OS media keys) ------------------------
+
+
+def set_soft(mock):
+    """Probe the soft backend. SendInput needs no device creation, so this is
+    a capability check only. In --mock the soft backend stays off so the mock
+    TV strip runs on the panel path (same as Linux)."""
+    global SOFT
+    if mock or not IS_WINDOWS:
+        SOFT = None
+        return
+    SOFT = {"adapter": "OS volume keys"}
+
+
+def soft_available():
+    return SOFT is not None
+
+
+def real_soft(op):
+    """Tap the matching volume media key. Windows handles VK_VOLUME_* exactly
+    like a hardware volume rocker: real volume change + on-screen indicator,
+    including a genuine mute toggle. ActionResult-shaped, with "muted" on the
+    mute op so the app's indicator updates without a follow-up poll."""
+    start = time.monotonic()
+    vk = _SOFT_VKS.get(op)
+    if vk is None:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "%s is not a volume op" % op, "duration_ms": 0}
+    try:
+        _send_inputs([_key_input(vk, True), _key_input(vk, False)])
+    except OSError as e:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "%s: %s" % (e.__class__.__name__, e),
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    result = {"ok": True, "exit_code": 0, "stdout": "sent %s" % op,
+              "stderr": "",
+              "duration_ms": int((time.monotonic() - start) * 1000)}
+    if op == "mute":
+        # Give the shell a beat to commit the toggle before reading it back.
+        time.sleep(0.1)
+        result["muted"] = read_box_muted()
+    return result
+
+
+def mock_soft(op):
+    """--mock stand-in for a box-volume op: log it, touch nothing, succeed."""
+    time.sleep(0.1)
+    print("[soft] %s" % op, flush=True)
+    return {"ok": True, "exit_code": 0, "stdout": "[mock soft] %s\n" % op,
+            "stderr": "", "duration_ms": 100}
+
+
+def _soft_volume_pct():
+    """Box volume as an integer 0-100, or None if unreadable. Reads the same
+    Core Audio endpoint that backs the mute state, so the app's slider and the
+    volume rocker agree."""
+    v = read_box_volume()
+    if v is None:
+        return None
+    return max(0, min(100, int(round(v * 100))))
+
+
+def soft_set_volume(level):
+    """Set the box volume to <level> percent (0-100) directly on the Core Audio
+    endpoint (SetMasterVolumeLevelScalar). Unlike the Linux agent, Windows has
+    no gamescope OSD to satisfy, and SetMasterVolumeLevelScalar is exactly what
+    the volume slider drives, so a single scalar write both changes the level
+    and shows nothing surprising. ActionResult-shaped, plus a "level" field so
+    the app's slider can snap to the real value."""
+    start = time.monotonic()
+    level = max(0, min(100, int(level)))
+
+    def result(ok, cur, note):
+        return {"ok": ok, "exit_code": 0 if ok else -1,
+                "stdout": note if ok else "", "stderr": "" if ok else note,
+                "level": cur,
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+
+    if not set_box_volume_scalar(level / 100.0):
+        return result(False, _soft_volume_pct(), "box volume set failed")
+    cur = _soft_volume_pct()
+    return result(True, level if cur is None else cur, "level %d" % level)
+
+
+# ---- unified dispatch --------------------------------------------------------
+
+
+# ---- cec_bridge backend (forward TV ops to a Pi wired to the TV over CEC) ----
+# Windows has no local CEC stack, so a box whose HDMI carries no CEC (most
+# desktops) can instead point at a Raspberry Pi running couchside-cec-bridge
+# that is plugged into the TV's HDMI. Config-driven (config.json "cec_bridge").
+CEC_BRIDGE = None
+CEC_BRIDGE_TIMEOUT = 12
+
+
+def set_cec_bridge(mock):
+    global CEC_BRIDGE
+    CEC_BRIDGE = dict(CONFIG_CEC_BRIDGE) if CONFIG_CEC_BRIDGE else None
+
+
+def cec_bridge_available():
+    return CEC_BRIDGE is not None
+
+
+def real_cec_bridge(op):
+    """Forward one TV op to the bridge (POST /cec/<op>, bearer token). The bridge
+    returns an ActionResult; pass it straight through. Transport errors become a
+    synthetic failure so the app shows a clean error, not a 500."""
+    b = CEC_BRIDGE
+    start = time.monotonic()
+    url = "http://%s:%d/cec/%s" % (b["host"], b["port"], op)
+    req = urllib.request.Request(
+        url, data=b"", method="POST",
+        headers={"Authorization": "Bearer " + b["token"]})
+    try:
+        with urllib.request.urlopen(req, timeout=CEC_BRIDGE_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+        if isinstance(body, dict) and "ok" in body:
+            return body
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "cec bridge returned an unexpected body",
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    except Exception as e:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "cec bridge %s: %s" % (url, e),
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+
+
+def mock_cec_bridge(op):
+    time.sleep(0.1)
+    print("[cec_bridge] %s -> %s:%d" % (op, CEC_BRIDGE["host"],
+                                        CEC_BRIDGE["port"]), flush=True)
+    return {"ok": True, "exit_code": 0,
+            "stdout": "[mock cec_bridge] %s\n" % op, "stderr": "",
+            "duration_ms": 100}
+
+
+# ---- Roku backend (ECP over plain HTTP) -----------------------------------
+# Roku devices expose the External Control Protocol (ECP) as an unauthenticated
+# HTTP service on port 8060 — no pairing, no token, no WebSocket. Key presses
+# are POST /keypress/<KEY>; power on/off are ECP keys too (Roku stays reachable
+# in standby, so unlike webOS/Samsung there is no Wake-on-LAN). Stateless: each
+# op is a one-shot POST. Pure stdlib HTTP, so this is a straight port of the
+# Linux agent's Roku backend.
+ROKU_PORT = 8060
+
+# Unified TV op -> ECP key.
+_ROKU_OP_KEY = {
+    "power_off": "PowerOff", "power_on": "PowerOn",
+    "volume_up": "VolumeUp", "volume_down": "VolumeDown", "mute": "VolumeMute",
+}
+
+# Factory-remote key (shared vocabulary) -> ECP key. Roku has no distinct
+# pause/stop (Play toggles) and no menu (Info is the "*" options key).
+_ROKU_KEYS = {
+    "up": "Up", "down": "Down", "left": "Left", "right": "Right", "ok": "Select",
+    "menu": "Info", "home": "Home", "back": "Back", "exit": "Home", "info": "Info",
+    "play": "Play", "pause": "Play", "stop": "Play", "rewind": "Rev",
+    "fast_forward": "Fwd",
+}
+
+ROKU_MOCK = False
+
+
+def _roku_result(start, ok, detail):
+    """Shape an ActionResult (same dict shape the panel/soft ops return)."""
+    ms = int((time.monotonic() - start) * 1000)
+    if ok:
+        return {"ok": True, "exit_code": 0, "stdout": detail + "\n",
+                "stderr": "", "duration_ms": ms}
+    return {"ok": False, "exit_code": -1, "stdout": "",
+            "stderr": detail, "duration_ms": ms}
+
+
+def _roku_tag(xml, tag):
+    """Extract <tag>...</tag> text from a Roku ECP XML blob, or None."""
+    open_t, close_t = "<%s>" % tag, "</%s>" % tag
+    a = xml.find(open_t)
+    if a < 0:
+        return None
+    a += len(open_t)
+    b = xml.find(close_t, a)
+    return xml[a:b].strip() if b > a else None
+
+
+def _roku_post(host, path, timeout=4):
+    """POST an empty body to a Roku ECP path. ActionResult-shaped."""
+    start = time.monotonic()
+    url = "http://%s:%d/%s" % (host, ROKU_PORT, path)
+    try:
+        req = urllib.request.Request(url, data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read()
+        return _roku_result(start, True, path)
+    except urllib.error.HTTPError as e:
+        # A reachable Roku that refuses control (403) has its "Control by mobile
+        # apps" network access set below permissive. Flag it so the app can tell
+        # the user exactly what to change on the TV.
+        res = _roku_result(start, False, "HTTP %d: %s" % (e.code, e.reason))
+        if e.code == 403:
+            res["hint"] = "roku_control_disabled"
+        return res
+    except OSError as e:            # URLError etc. are OSError subclasses
+        return _roku_result(start, False, "%s: %s" % (e.__class__.__name__, e))
+
+
+def set_roku(mock):
+    """Prepare the Roku backend. Nothing to open (stateless HTTP)."""
+    global ROKU_MOCK
+    ROKU_MOCK = mock
+
+
+def roku_available():
+    """True in --mock, or when config named a Roku host (no pairing needed)."""
+    if ROKU_MOCK:
+        return True
+    return bool(CONFIG_ROKU and CONFIG_ROKU.get("host"))
+
+
+def real_roku(op):
+    """Dispatch a unified TV op to an ECP keypress (power on/off included)."""
+    key = _ROKU_OP_KEY.get(op)
+    if key is None:
+        return _roku_result(time.monotonic(), False, "unsupported op %s" % op)
+    return _roku_post(CONFIG_ROKU["host"], "keypress/" + key)
+
+
+def real_roku_key(k):
+    """Send one factory-remote key (PANEL_KEYS vocabulary) as an ECP keypress."""
+    key = _ROKU_KEYS.get(k)
+    if key is None:
+        return _roku_result(time.monotonic(), False, "unknown key %s" % k)
+    return _roku_post(CONFIG_ROKU["host"], "keypress/" + key)
+
+
+def real_roku_text(text):
+    """Type text via ECP Lit_ keypresses, one character at a time."""
+    host = CONFIG_ROKU["host"]
+    for ch in text:
+        r = _roku_post(host, "keypress/Lit_" + quote(ch, safe=""))
+        if not r["ok"]:
+            return r
+    return _roku_result(time.monotonic(), True, "text (%d chars)" % len(text))
+
+
+def mock_roku(op):
+    """--mock stand-in: log the op, touch no network, succeed."""
+    time.sleep(0.02)
+    print("[roku] %s" % op, flush=True)
+    return {"ok": True, "exit_code": 0, "stdout": "[mock roku] %s\n" % op,
+            "stderr": "", "duration_ms": 20}
+
+
+def roku_add(host, timeout=4):
+    """Verify a Roku answers ECP at <host> and return its friendly name (Roku
+    needs no pairing). Raises IOError when it does not respond."""
+    url = "http://%s:%d/query/device-info" % (host, ROKU_PORT)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            xml = r.read().decode(errors="ignore")
+    except OSError as e:
+        raise IOError("Roku not reachable at %s: %s" % (host, e))
+    return (_roku_tag(xml, "user-device-name")
+            or _roku_tag(xml, "friendly-device-name")
+            or _roku_tag(xml, "default-device-name")
+            or _roku_tag(xml, "model-name") or host)
+
+
+def _roku_save(host, name):
+    """Persist the Roku config to CONFIG_PATH atomically and update CONFIG_ROKU."""
+    global CONFIG_ROKU
+    cfg = {"host": host, "name": name}
+    with CONFIG_LOCK:
+        _config_set_field("roku", cfg)
+        CONFIG_ROKU = cfg
+
+
+def set_tv(mock):
+    """Probe every TV backend at startup (call after load_config)."""
+    set_panel(mock)
+    set_cec_bridge(mock)
+    set_roku(mock)
+    set_soft(mock)
+
+
+def _tv_hw_backend():
+    """The external TV backend for power: the serial panel, then a CEC bridge
+    Pi, then nothing (Windows has no local CEC stack)."""
+    if panel_available():
+        return "panel"
+    if roku_available():
+        return "roku"
+    if cec_bridge_available():
+        return "cec_bridge"
+    return None
+
+
+def tv_info():
+    """GET /api/tv body, or None when nothing is controllable."""
+    hw = _tv_hw_backend()
+    box_vol = soft_available()
+    if hw is None and not box_vol:
+        return None
+    if hw == "panel":
+        backend, adapter = "panel", "Newline RS-232 (%s @ %d)" % (
+            PANEL["device"], PANEL["baud"])
+    elif hw == "roku":
+        backend, adapter = "roku", ("Roku (%s)" % CONFIG_ROKU.get("name")
+                                    if CONFIG_ROKU and CONFIG_ROKU.get("name")
+                                    else "Roku")
+    elif hw == "cec_bridge":
+        # Report as "cec" so the app treats it as a normal CEC TV backend.
+        backend, adapter = "cec", "CEC bridge (%s:%d)" % (
+            CEC_BRIDGE["host"], CEC_BRIDGE["port"])
+    else:
+        backend, adapter = "soft", SOFT["adapter"]
+    return {
+        "available": True,
+        "backend": backend,
+        "adapter": adapter,
+        "ops": list(TV_OPS),
+        "box_volume": box_vol,
+        "tv_volume": hw is not None,
+        "tv_power": hw is not None,
+        # D-pad + on-screen keyboard light up in the app only for backends that
+        # accept nav keys / text. Roku (ECP) does both; the RS-232 panel does
+        # not, so its keys/text stay false (unchanged behavior).
+        "keys": hw == "roku",
+        "text": hw == "roku",
+        "muted": read_box_muted() if box_vol else None,
+        # Current levels (0-100 or null) so the app's slider shows and keeps a
+        # real position. Box level is the Core Audio scalar; the Windows panel
+        # backend has no volume read-back, so tv_volume_level stays null.
+        "box_volume_level": _soft_volume_pct() if box_vol else None,
+        "tv_volume_level": None,
+    }
+
+
+def _send_tv_hw(op, mock):
+    """Route an op to the external TV backend (panel or CEC bridge), or None."""
+    b = _tv_hw_backend()
+    if b == "panel":
+        return mock_panel(op) if mock else real_panel(op)
+    if b == "roku":
+        return mock_roku(op) if mock else real_roku(op)
+    if b == "cec_bridge":
+        return mock_cec_bridge(op) if mock else real_cec_bridge(op)
+    return None
+
+
+def tv_send(op, mock, target=None):
+    """Dispatch a TV op. Power always goes to the external TV backend. Volume
+    goes to the box's own OS volume (soft) by default, or to the TV backend
+    when target == "tv". Falls back to whichever exists. None when nothing
+    can handle it (caller 404s)."""
+    if op in _POWER_OPS:
+        return _send_tv_hw(op, mock)
+    if target != "tv" and soft_available():
+        return mock_soft(op) if mock else real_soft(op)
+    r = _send_tv_hw(op, mock)
+    if r is not None:
+        return r
+    if soft_available():
+        return mock_soft(op) if mock else real_soft(op)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Now-playing + transport via Windows System Media Transport Controls (SMTC)
+#
+# The Windows analog of the Linux agent's MPRIS control. Two halves, each
+# best-effort and fully wrapped so failure degrades to 404/unavailable and
+# never touches an existing endpoint:
+#   * metadata  — the current SMTC session (title/artist/album/status/timeline)
+#                 read through WinRT's GlobalSystemMediaTransportControlsSession-
+#                 Manager, driven from a short PowerShell script (no pip WinRT
+#                 dep; stdlib only). Read-only.
+#   * transport — the OS media keys via SendInput (VK_MEDIA_*), exactly like a
+#                 keyboard's play/next/prev buttons. These are GLOBAL (the shell
+#                 routes them to the active session), so there is one synthetic
+#                 player id ("system") rather than a per-app address.
+#
+# NEEDS ON-WINDOWS TESTING: the PowerShell WinRT bridge (async GetAwaiter /
+# thumbnail stream) is written to the documented API but unverified on a real
+# box. All of it is wrapped; on any failure smtc_info() returns an available
+# session list that may be empty, and the app simply shows nothing.
+# ---------------------------------------------------------------------------
+
+VK_MEDIA_NEXT_TRACK = 0xB0
+VK_MEDIA_PREV_TRACK = 0xB1
+VK_MEDIA_STOP = 0xB2
+VK_MEDIA_PLAY_PAUSE = 0xB3
+
+# Transport op -> media-key VK. play/pause/play_pause all fold onto the single
+# hardware PLAY_PAUSE toggle (media keys expose no distinct play vs pause), so
+# the app's play and pause buttons both toggle — matching a real remote.
+SMTC_KEY_OPS = {
+    "play": VK_MEDIA_PLAY_PAUSE,
+    "pause": VK_MEDIA_PLAY_PAUSE,
+    "play_pause": VK_MEDIA_PLAY_PAUSE,
+    "next": VK_MEDIA_NEXT_TRACK,
+    "previous": VK_MEDIA_PREV_TRACK,
+    "stop": VK_MEDIA_STOP,
+}
+# Contract parity with MPRIS_OPS: the app may offer a seek control, but media
+# keys can't seek, so "seek" is accepted as a known op and reported unsupported.
+SMTC_OPS = tuple(SMTC_KEY_OPS) + ("seek",)
+
+# The single synthetic player id. SMTC transport is global, so there is no real
+# per-app addressing; the app just needs a stable id to POST ops against.
+SMTC_PLAYER_ID = "system"
+
+SMTC_ART_MAX = 2 * 1024 * 1024  # 2 MiB read cap on album art (MPRIS parity)
+SMTC_TIMEOUT = 6
+
+# Cache the last metadata read briefly so a poll of /api/media plus the app's
+# art fetch don't each spawn PowerShell; art resolution reuses the cached key.
+_SMTC_LOCK = threading.Lock()
+_SMTC_CACHE = {"at": 0.0, "val": None}
+_SMTC_TTL = 1.0
+
+# PowerShell that prints ONE line of JSON describing the current SMTC session,
+# or "null". Kept inert on failure (any throw -> the outer runner returns None).
+_SMTC_PS = r"""
+$ErrorActionPreference = 'Stop'
+function Await($t, $rt) {
+  $m = [System.WindowsRuntimeSystemExtensions].GetMethods() |
+    Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethod } |
+    Select-Object -First 1
+  $g = $m.MakeGenericMethod($rt)
+  $task = $g.Invoke($null, @($t))
+  $task.Wait(-1) | Out-Null
+  return $task.Result
+}
+try {
+  [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType=WindowsRuntime] | Out-Null
+  [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManagerRequestedEventArgs, Windows.Media.Control, ContentType=WindowsRuntime] | Out-Null
+  $mgrType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]
+  $mgr = Await ($mgrType::RequestAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
+  $s = $mgr.GetCurrentSession()
+  if ($null -eq $s) { 'null'; exit 0 }
+  $props = Await ($s.TryGetMediaPropertiesAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties])
+  $pb = $s.GetPlaybackInfo()
+  $tl = $s.GetTimelineProperties()
+  $status = [int]$pb.PlaybackStatus
+  $hasArt = $false
+  if ($props.Thumbnail -ne $null) { $hasArt = $true }
+  $o = [ordered]@{
+    id       = [string]$s.SourceAppUserModelId
+    title    = [string]$props.Title
+    artist   = [string]$props.Artist
+    album    = [string]$props.AlbumTitle
+    status   = $status
+    pos_ms   = [long]$tl.Position.TotalMilliseconds
+    len_ms   = [long]$tl.EndTime.TotalMilliseconds
+    can_next = [bool]$pb.Controls.IsNextEnabled
+    can_prev = [bool]$pb.Controls.IsPreviousEnabled
+    can_play = [bool]$pb.Controls.IsPlayEnabled
+    can_pause= [bool]$pb.Controls.IsPauseEnabled
+    has_art  = $hasArt
+  }
+  ($o | ConvertTo-Json -Compress)
+} catch { 'null' }
+"""
+
+# PowerShell that writes the current SMTC thumbnail to $env:CS_ART_OUT and
+# prints "ok"/"none". Separate from metadata so the (heavier) stream copy runs
+# only when the app actually requests art.
+_SMTC_ART_PS = r"""
+$ErrorActionPreference = 'Stop'
+function Await($t, $rt) {
+  $m = [System.WindowsRuntimeSystemExtensions].GetMethods() |
+    Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethod } |
+    Select-Object -First 1
+  $g = $m.MakeGenericMethod($rt)
+  $task = $g.Invoke($null, @($t))
+  $task.Wait(-1) | Out-Null
+  return $task.Result
+}
+try {
+  [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType=WindowsRuntime] | Out-Null
+  $mgrType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]
+  $mgr = Await ($mgrType::RequestAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
+  $s = $mgr.GetCurrentSession()
+  if ($null -eq $s) { 'none'; exit 0 }
+  $props = Await ($s.TryGetMediaPropertiesAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties])
+  if ($props.Thumbnail -eq $null) { 'none'; exit 0 }
+  $stream = Await ($props.Thumbnail.OpenReadAsync()) ([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
+  $size = [int]$stream.Size
+  if ($size -le 0 -or $size -gt 2097152) { 'none'; exit 0 }
+  $reader = [Windows.Storage.Streams.DataReader]::new($stream)
+  Await ($reader.LoadAsync($size)) ([uint32]) | Out-Null
+  $bytes = New-Object byte[] $size
+  $reader.ReadBytes($bytes)
+  [System.IO.File]::WriteAllBytes($env:CS_ART_OUT, $bytes)
+  'ok'
+} catch { 'none' }
+"""
+
+# SMTC PlaybackStatus enum -> the app's status vocabulary (MPRIS parity).
+_SMTC_STATUS = {4: "Playing", 5: "Paused"}
+
+
+def _smtc_str(v):
+    return v if isinstance(v, str) else ""
+
+
+def _smtc_art_key(session):
+    """Stable cache-buster for the current track's art, derived from the track
+    identity (never a path). Changes when the track changes."""
+    basis = "%s|%s|%s" % (session.get("title", ""), session.get("artist", ""),
+                          session.get("album", ""))
+    return hashlib.sha1(basis.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _run_powershell(script, timeout, env=None):
+    """Run a PowerShell script from stdin; return stdout text, or None on any
+    failure. -Command - reads the script from stdin so no temp file / no
+    quoting minefield. Never raises."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", "-"],
+            input=script, capture_output=True, text=True, timeout=timeout,
+            creationflags=_RUN_FLAGS, env=env)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def _smtc_read():
+    """Current SMTC session as a raw dict (PowerShell JSON), or None. Cached
+    for _SMTC_TTL to keep /api/media polling cheap. Never raises."""
+    if not IS_WINDOWS:
+        return None
+    now = time.monotonic()
+    with _SMTC_LOCK:
+        if _SMTC_CACHE["val"] is not None and now - _SMTC_CACHE["at"] < _SMTC_TTL:
+            return _SMTC_CACHE["val"]
+    out = _run_powershell(_SMTC_PS, SMTC_TIMEOUT)
+    val = None
+    if out:
+        line = out.strip()
+        if line and line.lower() != "null":
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    val = parsed
+            except Exception:
+                val = None
+    with _SMTC_LOCK:
+        _SMTC_CACHE.update(at=time.monotonic(), val=val)
+    return val
+
+
+def _smtc_player_info():
+    """The single SMTC player dict (MPRIS-player-shaped), or None when nothing
+    is playing/paused. Never raises."""
+    session = _smtc_read()
+    if not isinstance(session, dict):
+        return None
+    status = _SMTC_STATUS.get(session.get("status"), "Stopped")
+    def _int(v):
+        try:
+            return max(0, int(v))
+        except (TypeError, ValueError):
+            return 0
+    has_art = bool(session.get("has_art"))
+    return {
+        "id": SMTC_PLAYER_ID,
+        "identity": _smtc_str(session.get("id")) or "Media",
+        "status": status,
+        "title": _smtc_str(session.get("title")),
+        "artist": _smtc_str(session.get("artist")),
+        "album": _smtc_str(session.get("album")),
+        "position_ms": _int(session.get("pos_ms")),
+        "length_ms": _int(session.get("len_ms")),
+        "rate": 1.0,
+        # Media keys can't seek; report no seek so the app hides the scrubber.
+        "can_seek": False,
+        "can_go_next": bool(session.get("can_next")),
+        "can_go_previous": bool(session.get("can_prev")),
+        "can_play": bool(session.get("can_play")),
+        "can_pause": bool(session.get("can_pause")),
+        "art": has_art,
+        "art_key": _smtc_art_key(session) if has_art else "",
+    }
+
+
+def smtc_available():
+    """True when SMTC control is even plausible (Windows). The metadata read is
+    probe-and-appear at /api/media, so this only gates the whole feature off on
+    non-Windows."""
+    return IS_WINDOWS
+
+
+def smtc_info():
+    """{"available":True,"players":[...]} or None when SMTC is unavailable.
+    A live-but-idle box returns an empty players list (matches MPRIS)."""
+    if not smtc_available():
+        return None
+    info = _smtc_player_info()
+    return {"available": True, "players": [info] if info is not None else []}
+
+
+def real_smtc_op(player, op):
+    """Run a transport op by tapping the matching media key. ActionResult-shaped,
+    or None for an unknown player / unsupported op (route 404s). The media key is
+    global, so `player` is validated only against the synthetic id."""
+    if player != SMTC_PLAYER_ID:
+        return None
+    start = time.monotonic()
+    if op == "seek":
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "seek is not supported over media keys",
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    vk = SMTC_KEY_OPS.get(op)
+    if vk is None:
+        return None
+    try:
+        _send_inputs([_key_input(vk, True), _key_input(vk, False)])
+    except OSError as e:
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "%s: %s" % (e.__class__.__name__, e),
+                "duration_ms": int((time.monotonic() - start) * 1000)}
+    # A key tap invalidates the cached metadata (status likely changed).
+    with _SMTC_LOCK:
+        _SMTC_CACHE.update(at=0.0, val=None)
+    return {"ok": True, "exit_code": 0, "stdout": "sent %s" % op, "stderr": "",
+            "duration_ms": int((time.monotonic() - start) * 1000)}
+
+
+def smtc_art(player, art_key):
+    """Resolve the CURRENT session's thumbnail bytes (the client supplies no
+    path), enforce the 2 MiB cap, and sniff the image type. Returns (data, mime)
+    or None. `art_key` must match the current track's key (else the track
+    changed -> 404). Never raises."""
+    if player != SMTC_PLAYER_ID:
+        return None
+    session = _smtc_read()
+    if not isinstance(session, dict) or not session.get("has_art"):
+        return None
+    if art_key and _smtc_art_key(session) != art_key:
+        return None
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="cs-art-", suffix=".img")
+        os.close(fd)
+        env = dict(os.environ)
+        env["CS_ART_OUT"] = tmp
+        out = _run_powershell(_SMTC_ART_PS, SMTC_TIMEOUT, env=env)
+        if not out or out.strip().lower() != "ok":
+            return None
+        if os.path.getsize(tmp) > SMTC_ART_MAX:
+            return None
+        with open(tmp, "rb") as f:
+            data = f.read(SMTC_ART_MAX + 1)
+        if not data or len(data) > SMTC_ART_MAX:
+            return None
+        mime = _sniff_image(data)
+        return (data, mime) if mime else None
+    except Exception:
+        return None
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+# --- SMTC mock (parity with mock_mpris_*) ------------------------------------
+_MOCK_SMTC_POS = 0
+# 1x1 transparent PNG so --mock album art works off-box.
+_MOCK_ART_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+
+
+def mock_smtc_info():
+    global _MOCK_SMTC_POS
+    _MOCK_SMTC_POS = (_MOCK_SMTC_POS + 3000) % 214000
+    return {"available": True, "players": [{
+        "id": SMTC_PLAYER_ID, "identity": "Groove", "status": "Playing",
+        "title": "Midnight City", "artist": "M83",
+        "album": "Hurry Up, We're Dreaming",
+        "position_ms": _MOCK_SMTC_POS, "length_ms": 214000, "rate": 1.0,
+        "can_seek": False, "can_go_next": True, "can_go_previous": True,
+        "can_play": True, "can_pause": True, "art": True,
+        "art_key": "mockart1",
+    }]}
+
+
+def mock_smtc_op(player, op):
+    if player != SMTC_PLAYER_ID:
+        return None
+    if op == "seek":
+        return {"ok": False, "exit_code": -1, "stdout": "",
+                "stderr": "seek is not supported over media keys",
+                "duration_ms": 10}
+    if op not in SMTC_KEY_OPS:
+        return None
+    print("[smtc] %s %s" % (player, op), flush=True)
+    return {"ok": True, "exit_code": 0,
+            "stdout": "[mock smtc] %s %s" % (player, op),
+            "stderr": "", "duration_ms": 40}
+
+
+def mock_smtc_art(player, art_key):
+    if player != SMTC_PLAYER_ID:
+        return None
+    return (_MOCK_ART_PNG, "image/png")
+
+
+# --- image magic-byte sniffing (shared by SMTC art + screen frames) ----------
+_ART_MAGIC = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def _sniff_image(data):
+    """Magic-byte image type, or None (so a text/HTML file can't be served)."""
+    for magic, mime in _ART_MAGIC:
+        if data.startswith(magic):
+            return mime
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Screen preview: one downscaled JPEG frame per request via GDI BitBlt.
+#
+# The Windows analog of the Linux agent's gamescope/grim capture. Pure ctypes
+# GDI (CreateCompatibleDC/BitBlt/GetDIBits over the virtual screen), downscaled
+# with StretchBlt (HALFTONE), then encoded to JPEG. No PIL: JPEG comes from the
+# built-in Windows Imaging Component (WIC) via a tiny PowerShell one-liner that
+# re-encodes a stdlib-written BMP, keeping this dependency-free. Single-flight +
+# a short cache cap the capture rate exactly like the Linux path.
+#
+# 404 semantics: capture is BLOCKED on the secure desktop (UAC / lock screen)
+# and from a session-0 service; both surface as a BitBlt/GetDIBits failure, and
+# real_screen_frame() returns None so the route replies 503 (transient) while
+# screen_info() still advertises the backend. When capture can never work
+# (non-Windows real mode) screen_info() returns None so /api/screen 404s and the
+# app hides the card entirely.
+#
+# Native GDI + JPEG capture verified from an interactive Windows user session.
+# Secure/session-0 capture remains unavailable by design.
+# ---------------------------------------------------------------------------
+
+SCREEN_WIDTH = 960                 # downscale target width
+SCREEN_MAX_BYTES = 12 * 1024 * 1024
+SCREEN_MIN_INTERVAL_S = 0.5        # server floor: at most ~2 captures/sec
+SCREEN_CAPTURE_TIMEOUT_S = 8
+SCREEN_LOCK = threading.Lock()     # single-flight: never stack captures
+_SCREEN_CACHE = {"ts": 0.0, "data": None, "mime": None}
+_SCREEN = None                     # capability dict or None; set by set_screen
+
+if IS_WINDOWS:
+    _gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+
+    SM_XVIRTUALSCREEN = 76
+    SM_YVIRTUALSCREEN = 77
+    SM_CXVIRTUALSCREEN = 78
+    SM_CYVIRTUALSCREEN = 79
+    SRCCOPY = 0x00CC0020
+    DIB_RGB_COLORS = 0
+    BI_RGB = 0
+    HALFTONE = 4
+
+    class _BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+            ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+            ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+            ("biSizeImage", ctypes.c_uint32),
+            ("biXPelsPerMeter", ctypes.c_int32),
+            ("biYPelsPerMeter", ctypes.c_int32),
+            ("biClrUsed", ctypes.c_uint32), ("biClrImportant", ctypes.c_uint32),
+        ]
+
+    class _BITMAPINFO(ctypes.Structure):
+        _fields_ = [("bmiHeader", _BITMAPINFOHEADER),
+                    ("bmiColors", ctypes.c_uint32 * 3)]
+
+
+def _bmp_bytes(width, height, bgr_rows_top_down):
+    """Wrap top-down 24-bit BGR scanlines (each padded to a 4-byte boundary) in
+    a BITMAPFILEHEADER+BITMAPINFOHEADER so WIC can re-encode it. Negative height
+    marks the DIB top-down."""
+    row_stride = (width * 3 + 3) & ~3
+    pixel_bytes = row_stride * height
+    # BITMAPFILEHEADER (14) + BITMAPINFOHEADER (40)
+    file_size = 14 + 40 + pixel_bytes
+    fileheader = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, 14 + 40)
+    infoheader = struct.pack("<IiiHHIIiiII", 40, width, -height, 1, 24,
+                             BI_RGB, pixel_bytes, 0, 0, 0, 0)
+    return fileheader + infoheader + bgr_rows_top_down
+
+
+def set_screen(mock):
+    """Probe the capture path (call after load_config). --mock always advertises
+    a stdlib PNG backend. Real Windows advertises the GDI backend unconditionally
+    (whether a given frame succeeds is decided per-request); non-Windows real
+    mode has no capture path."""
+    global _SCREEN
+    if mock:
+        _SCREEN = {"session": "mock", "backends": ["mock"]}
+    elif IS_WINDOWS:
+        _SCREEN = {"session": "desktop", "backends": ["gdi"]}
+    else:
+        _SCREEN = None
+
+
+def _physical_desktop(fn):
+    """Use physical pixels on this capture thread; restore its prior DPI context.
+
+    A DPI-virtualized GetSystemMetrics result can be smaller than the pixels
+    returned by GDI, cropping high-DPI desktops. Never change process DPI state.
+    """
+    @wraps(fn)
+    def call(*args, **kwargs):
+        previous = None
+        setter = None
+        if IS_WINDOWS:
+            try:
+                setter = _user32.SetThreadDpiAwarenessContext
+                setter.argtypes = [ctypes.c_void_p]
+                setter.restype = ctypes.c_void_p
+                previous = setter(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+            except (AttributeError, OSError):
+                pass
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if previous and setter:
+                setter(previous)
+    return call
+
+
+@_physical_desktop
+def _screen_pointer():
+    """Optional cursor coordinates within the virtual-desktop preview, 0..1.
+
+    Images from GDI omit the hardware cursor. A separate bounded position lets
+    a desktop viewer draw it without changing existing screenshot bytes.
+    """
+    if not IS_WINDOWS or _user32 is None:
+        return None
+    try:
+        point = (ctypes.c_long * 2)()
+        _user32.GetCursorPos.argtypes = [ctypes.c_void_p]
+        _user32.GetCursorPos.restype = ctypes.c_int
+        if not _user32.GetCursorPos(ctypes.byref(point)):
+            return None
+        _user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        _user32.GetSystemMetrics.restype = ctypes.c_int
+        x, y, width, height = (_user32.GetSystemMetrics(k) for k in
+                              (SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+                               SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN))
+        if width <= 1 or height <= 1:
+            return None
+        return {"x": max(0.0, min(1.0, (point[0] - x) / (width - 1))),
+                "y": max(0.0, min(1.0, (point[1] - y) / (height - 1)))}
+    except Exception:
+        return None
+
+
+def screen_info():
+    """{available, session, backends, formats} or None when no capture path."""
+    if _SCREEN is None:
+        return None
+    info = {"available": True, "session": _SCREEN["session"],
+            "backends": _SCREEN["backends"], "formats": ["image/jpeg"]}
+    pointer = _screen_pointer()
+    if pointer is not None:
+        info["pointer"] = pointer
+    return info
+
+
+@_physical_desktop
+def _capture_bmp():
+    """Grab the whole virtual screen, downscale to SCREEN_WIDTH via StretchBlt,
+    and return (bmp_bytes, w, h) or None on any failure (secure desktop, no
+    session). Never raises. Pure GDI: no third-party capture lib."""
+    if not IS_WINDOWS:
+        return None
+    src_dc = mem_dc = dst_dc = None
+    src_bmp = dst_bmp = None
+    try:
+        _user32.GetSystemMetrics.restype = ctypes.c_int
+        vx = _user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        vy = _user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        vw = _user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        vh = _user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        if vw <= 0 or vh <= 0:
+            return None
+        # Downscale target: cap width at SCREEN_WIDTH, keep aspect (never upsize).
+        if vw > SCREEN_WIDTH:
+            dw = SCREEN_WIDTH
+            dh = max(1, int(round(vh * (SCREEN_WIDTH / float(vw)))))
+        else:
+            dw, dh = vw, vh
+
+        _user32.GetDC.restype = ctypes.c_void_p
+        _user32.GetDC.argtypes = [ctypes.c_void_p]
+        src_dc = _user32.GetDC(None)
+        if not src_dc:
+            return None
+        _gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+        _gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        _gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+        _gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p,
+                                                  ctypes.c_int, ctypes.c_int]
+        mem_dc = _gdi32.CreateCompatibleDC(src_dc)
+        dst_dc = _gdi32.CreateCompatibleDC(src_dc)
+        if not mem_dc or not dst_dc:
+            return None
+        src_bmp = _gdi32.CreateCompatibleBitmap(src_dc, vw, vh)
+        dst_bmp = _gdi32.CreateCompatibleBitmap(src_dc, dw, dh)
+        if not src_bmp or not dst_bmp:
+            return None
+        _gdi32.SelectObject.restype = ctypes.c_void_p
+        _gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _gdi32.SelectObject(mem_dc, src_bmp)
+        _gdi32.SelectObject(dst_dc, dst_bmp)
+        _gdi32.BitBlt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_uint32]
+        if not _gdi32.BitBlt(mem_dc, 0, 0, vw, vh, src_dc, vx, vy, SRCCOPY):
+            return None
+        _gdi32.SetStretchBltMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _gdi32.SetStretchBltMode(dst_dc, HALFTONE)
+        _gdi32.StretchBlt.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint32]
+        if not _gdi32.StretchBlt(dst_dc, 0, 0, dw, dh, mem_dc, 0, 0, vw, vh,
+                                 SRCCOPY):
+            return None
+        # Pull the downscaled bitmap out as top-down 24-bit BGR.
+        bmi = _BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = dw
+        bmi.bmiHeader.biHeight = -dh   # negative => top-down
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 24
+        bmi.bmiHeader.biCompression = BI_RGB
+        row_stride = (dw * 3 + 3) & ~3
+        buf = ctypes.create_string_buffer(row_stride * dh)
+        _gdi32.GetDIBits.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.POINTER(_BITMAPINFO), ctypes.c_uint32]
+        scanned = _gdi32.GetDIBits(dst_dc, dst_bmp, 0, dh, buf,
+                                   ctypes.byref(bmi), DIB_RGB_COLORS)
+        if scanned == 0:
+            return None
+        return (_bmp_bytes(dw, dh, buf.raw), dw, dh)
+    except Exception:
+        return None
+    finally:
+        try:
+            if src_bmp:
+                _gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+                _gdi32.DeleteObject(src_bmp)
+            if dst_bmp:
+                _gdi32.DeleteObject(dst_bmp)
+            if mem_dc:
+                _gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+                _gdi32.DeleteDC(mem_dc)
+            if dst_dc:
+                _gdi32.DeleteDC(dst_dc)
+            if src_dc:
+                _user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                _user32.ReleaseDC(None, src_dc)
+        except Exception:
+            pass
+
+
+# PowerShell that re-encodes a BMP ($env:CS_BMP_IN) to a JPEG
+# ($env:CS_JPG_OUT) using the built-in System.Drawing codec (WIC). Prints
+# "ok"/"err". Keeps JPEG encoding dependency-free (no PIL).
+_SCREEN_JPEG_PS = r"""
+$ErrorActionPreference = 'Stop'
+try {
+  Add-Type -AssemblyName System.Drawing
+  $img = [System.Drawing.Image]::FromFile($env:CS_BMP_IN)
+  try { $img.Save($env:CS_JPG_OUT, [System.Drawing.Imaging.ImageFormat]::Jpeg) }
+  finally { $img.Dispose() }
+  'ok'
+} catch { 'err' }
+"""
+
+
+def _bmp_to_jpeg(bmp):
+    """Re-encode BMP bytes to JPEG via the Windows System.Drawing codec. Returns
+    JPEG bytes or None. Never raises."""
+    bmp_path = jpg_path = None
+    try:
+        fd, bmp_path = tempfile.mkstemp(prefix="cs-scr-", suffix=".bmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(bmp)
+        fd, jpg_path = tempfile.mkstemp(prefix="cs-scr-", suffix=".jpg")
+        os.close(fd)
+        env = dict(os.environ)
+        env["CS_BMP_IN"] = bmp_path
+        env["CS_JPG_OUT"] = jpg_path
+        # PowerShell 5.1 -Command - needs a blank line to submit the final
+        # multiline try/catch block. Without it stdin EOF exits 0 with no JPEG.
+        out = _run_powershell(_SCREEN_JPEG_PS + "\n", SCREEN_CAPTURE_TIMEOUT_S, env=env)
+        if not out or out.strip().lower() != "ok":
+            return None
+        with open(jpg_path, "rb") as f:
+            data = f.read(SCREEN_MAX_BYTES + 1)
+        if not data or len(data) > SCREEN_MAX_BYTES:
+            return None
+        return data if _sniff_image(data) == "image/jpeg" else None
+    except Exception:
+        return None
+    finally:
+        for p in (bmp_path, jpg_path):
+            if p:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+def real_screen_frame():
+    """One fresh JPEG frame as (data, "image/jpeg"), or None when capture is
+    blocked/failing (secure desktop, session-0). Single-flight + short cache so
+    concurrent clients share one capture (matches the Linux path). Never raises."""
+    if _SCREEN is None:
+        return None
+    now = time.monotonic()
+    if _SCREEN_CACHE["data"] is not None and now - _SCREEN_CACHE["ts"] < SCREEN_MIN_INTERVAL_S:
+        return (_SCREEN_CACHE["data"], _SCREEN_CACHE["mime"])
+    if not SCREEN_LOCK.acquire(blocking=False):
+        # Another capture is in flight; serve the last frame if we have one.
+        if _SCREEN_CACHE["data"] is not None:
+            return (_SCREEN_CACHE["data"], _SCREEN_CACHE["mime"])
+        SCREEN_LOCK.acquire()
+    try:
+        now = time.monotonic()
+        if _SCREEN_CACHE["data"] is not None and now - _SCREEN_CACHE["ts"] < SCREEN_MIN_INTERVAL_S:
+            return (_SCREEN_CACHE["data"], _SCREEN_CACHE["mime"])
+        cap = _capture_bmp()
+        if cap is None:
+            return None
+        bmp, _w, _h = cap
+        data = _bmp_to_jpeg(bmp)
+        if not data:
+            return None
+        _SCREEN_CACHE.update(ts=time.monotonic(), data=data, mime="image/jpeg")
+        return (data, "image/jpeg")
+    finally:
+        SCREEN_LOCK.release()
+
+
+_MOCK_SCREEN_N = 0
+
+
+def _encode_png(w, h, rows):
+    """Encode 8-bit RGBA scanlines (each `bytes` of length w*4) to PNG bytes.
+    Pure zlib + struct, no PIL (mirrors the Linux agent)."""
+    import zlib
+
+    def _chunk(tag, data):
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xffffffff))
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)  # RGBA, no interlace
+    raw = b"".join(b"\x00" + r for r in rows)  # per-scanline filter byte 0
+    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(raw, 6)) + _chunk(b"IEND", b""))
+
+
+def mock_screen_frame():
+    """--mock: a small stdlib PNG with a moving band, so the app's preview works
+    off-box."""
+    global _MOCK_SCREEN_N
+    _MOCK_SCREEN_N += 1
+    w, h = 320, 180
+    band = (_MOCK_SCREEN_N * 12) % w
+    rows = []
+    for y in range(h):
+        row = bytearray()
+        for x in range(w):
+            r = 220 if abs(x - band) <= 6 else 30
+            row += bytes((r, (255 * y) // h, (255 * x) // w, 255))
+        rows.append(bytes(row))
+    return (_encode_png(w, h, rows), "image/png")
+
+
+# ---------------------------------------------------------------------------
+# Sleep timer + scheduled wake (/api/power/schedule|sleep|wake).
+#
+# The Windows analog of the Linux agent's threading.Timer suspend + RTC alarm.
+#   * sleep — an in-process one-shot threading.Timer firing the existing
+#             suspend/poweroff action; deliberately volatile (a restart clears
+#             it; the app detects that by polling). Identical to Linux.
+#   * wake  — a scheduled wake set with SetWaitableTimer(fResume=TRUE) on a
+#             DEDICATED daemon thread that blocks in WaitForSingleObject until
+#             the timer fires (the OS then resumes the machine from sleep). This
+#             mirrors the Linux RTC alarm's "survives the suspend" contract as
+#             closely as a user-mode agent can: the timer object lives as long
+#             as the agent process, so the wake holds across a suspend but NOT
+#             across an agent restart/reboot (documented; the app polls state).
+#
+# A waitable timer only resumes the box if the platform allows wake timers
+# (powercfg) and the agent process stays alive across the suspend — true for the
+# logon-triggered task the agent runs under. NEEDS ON-WINDOWS TESTING.
+# ---------------------------------------------------------------------------
+
+SLEEP_MIN_S, SLEEP_MAX_S = 60, 8 * 3600
+WAKE_MIN_S, WAKE_MAX_S = 120, 86100
+SLEEP_ACTIONS = ("suspend", "poweroff")
+
+POWER_MOCK = False          # set by set_power_schedule(mock)
+SLEEP_LOCK = threading.Lock()
+_SLEEP = {"timer": None, "action": None, "fire_at": 0.0}
+
+WAKE_LOCK = threading.Lock()
+# {"handle": HANDLE, "thread": Thread, "fire_at": epoch, "cancel": Event} or None
+_WAKE = None
+_MOCK_WAKE = {"fire_at": 0}
+
+
+def set_power_schedule(mock):
+    global POWER_MOCK
+    POWER_MOCK = mock
+
+
+def sleep_can_arm(action):
+    """(ok, error). The action must be a known sleep action present in ACTIONS.
+    Unlike Linux there is no sudoers gate (an interactive Windows user may
+    suspend/shutdown unprivileged), so presence in ACTIONS is sufficient."""
+    if action not in SLEEP_ACTIONS:
+        return (False, "unknown action")
+    if POWER_MOCK:
+        return (True, None)
+    if ACTIONS.get(action) is None:
+        return (False, "%s unavailable" % action)
+    return (True, None)
+
+
+def _sleep_info_locked():
+    if _SLEEP["timer"] is None:
+        return None
+    return {"action": _SLEEP["action"], "fire_at": int(_SLEEP["fire_at"]),
+            "remaining_s": max(0, int(_SLEEP["fire_at"] - time.time()))}
+
+
+def _sleep_cancel_locked():
+    if _SLEEP["timer"] is not None:
+        _SLEEP["timer"].cancel()
+    _SLEEP.update(timer=None, action=None, fire_at=0.0)
+
+
+def sleep_arm(delay_s, action):
+    """Arm a one-shot suspend/poweroff after delay_s, replacing any prior arm."""
+    with SLEEP_LOCK:
+        _sleep_cancel_locked()
+        fire_at = time.time() + delay_s
+
+        def _fire():
+            with SLEEP_LOCK:
+                if _SLEEP["timer"] is not timer:  # cancelled or superseded
+                    return
+                _SLEEP.update(timer=None, action=None, fire_at=0.0)
+            r = mock_action(action) if POWER_MOCK else real_action(action)
+            print("[sleep] fired %s: ok=%s" % (action, r.get("ok")), flush=True)
+
+        timer = threading.Timer(delay_s, _fire)
+        timer.daemon = True
+        _SLEEP.update(timer=timer, action=action, fire_at=fire_at)
+        timer.start()
+        return _sleep_info_locked()
+
+
+def sleep_cancel():
+    with SLEEP_LOCK:
+        _sleep_cancel_locked()
+
+
+def sleep_info():
+    with SLEEP_LOCK:
+        return _sleep_info_locked()
+
+
+def wake_available():
+    """True when a scheduled wake can be armed: --mock, or a real Windows box
+    (waitable timers are always present; whether the platform actually resumes
+    is a powercfg/BIOS concern the app surfaces to the user)."""
+    return POWER_MOCK or IS_WINDOWS
+
+
+if IS_WINDOWS:
+    # SetWaitableTimer / CreateWaitableTimerW signatures.
+    _kernel32.CreateWaitableTimerW.restype = ctypes.c_void_p
+    _kernel32.CreateWaitableTimerW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                               ctypes.c_wchar_p]
+    _kernel32.SetWaitableTimer.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64), ctypes.c_long,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    _kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    _kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+
+
+def _wake_clear_locked():
+    global _WAKE
+    if _WAKE is not None:
+        _WAKE["cancel"].set()
+        if IS_WINDOWS and _WAKE.get("handle"):
+            try:
+                # CancelWaitableTimer then CloseHandle so the waiter unblocks.
+                _kernel32.CancelWaitableTimer(ctypes.c_void_p(_WAKE["handle"]))
+                _kernel32.CloseHandle(ctypes.c_void_p(_WAKE["handle"]))
+            except Exception:
+                pass
+        _WAKE = None
+
+
+def wake_set(at_epoch):
+    """Arm a resume-from-sleep at wall-time at_epoch via SetWaitableTimer with
+    fResume=TRUE, replacing any prior wake. Returns True on success. A dedicated
+    daemon thread blocks on the timer so the object stays referenced until it
+    fires or is cancelled."""
+    global _WAKE
+    if POWER_MOCK:
+        with WAKE_LOCK:
+            _MOCK_WAKE["fire_at"] = int(at_epoch)
+        print("[wake] mock alarm at %d" % int(at_epoch), flush=True)
+        return True
+    if not IS_WINDOWS:
+        return False
+    with WAKE_LOCK:
+        _wake_clear_locked()
+        try:
+            handle = _kernel32.CreateWaitableTimerW(None, 1, None)  # manual reset
+            if not handle:
+                return False
+            # Negative 100ns relative time, or a positive absolute FILETIME. Use
+            # an ABSOLUTE due-time so clock skew between now and fire is exact:
+            # FILETIME epoch is 1601-01-01; 116444736000000000 100ns ticks to
+            # the Unix epoch.
+            due_ft = int((at_epoch + 11644473600) * 10000000)
+            due = ctypes.c_int64(due_ft)
+            # fResume=TRUE (last arg) => wake the system from sleep when it fires.
+            ok = _kernel32.SetWaitableTimer(
+                ctypes.c_void_p(handle), ctypes.byref(due), 0, None, None, 1)
+            if not ok:
+                _kernel32.CloseHandle(ctypes.c_void_p(handle))
+                return False
+        except Exception:
+            return False
+
+        cancel = threading.Event()
+
+        def _waiter(h=handle, ev=cancel, fire_at=int(at_epoch)):
+            # Block until the timer fires (resuming the box) or we're cancelled.
+            try:
+                _kernel32.WaitForSingleObject(ctypes.c_void_p(h), 0xFFFFFFFF)
+            except Exception:
+                pass
+            if not ev.is_set():
+                print("[wake] fired at %d" % fire_at, flush=True)
+            with WAKE_LOCK:
+                global _WAKE
+                if _WAKE is not None and _WAKE.get("handle") == h:
+                    try:
+                        _kernel32.CloseHandle(ctypes.c_void_p(h))
+                    except Exception:
+                        pass
+                    _WAKE = None
+
+        t = threading.Thread(target=_waiter, daemon=True, name="wake-timer")
+        _WAKE = {"handle": handle, "thread": t, "fire_at": int(at_epoch),
+                 "cancel": cancel}
+        t.start()
+        return True
+
+
+def wake_clear():
+    """Cancel the scheduled wake (idempotent)."""
+    if POWER_MOCK:
+        with WAKE_LOCK:
+            _MOCK_WAKE["fire_at"] = 0
+        return True
+    with WAKE_LOCK:
+        _wake_clear_locked()
+    return True
+
+
+def wake_info():
+    """Current scheduled wake as {fire_at, remaining_s} (wall time) or None."""
+    if POWER_MOCK:
+        fa = _MOCK_WAKE["fire_at"]
+        if fa and fa > time.time():
+            return {"fire_at": int(fa), "remaining_s": int(fa - time.time())}
+        return None
+    with WAKE_LOCK:
+        if _WAKE is None:
+            return None
+        fa = _WAKE["fire_at"]
+    if fa and fa > time.time():
+        return {"fire_at": int(fa), "remaining_s": int(fa - time.time())}
+    return None
+
+
+def power_schedule_info():
+    """The /api/power/schedule payload (matches the Linux shape)."""
+    return {
+        "sleep": sleep_info(),
+        "wake": wake_info(),
+        "wake_available": wake_available(),
+        "limits": {"sleep_min_s": SLEEP_MIN_S, "sleep_max_s": SLEEP_MAX_S,
+                   "wake_min_s": WAKE_MIN_S, "wake_max_s": WAKE_MAX_S},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Virtual gamepad: ViGEmBus (Xbox 360) via ViGEmClient.dll
+#
+# The ViGEmBus kernel driver is the Windows equivalent of uinput for pads
+# (what DS4Windows/Parsec use). Games see a real wired 360 controller. The
+# driver is a documented prerequisite (install.ps1 points at the official
+# installer); without it the WS handshake still completes and the client gets
+# an err frame, exactly like a Linux box without /dev/uinput access.
+# ---------------------------------------------------------------------------
+
+VIGEM_ERROR_NONE = 0x20000000
+
+# protocol button key -> XUSB_REPORT wButtons bit
+XUSB_BTN_BITS = {
+    "du": 0x0001, "dd": 0x0002, "dl": 0x0004, "dr": 0x0008,
+    "start": 0x0010, "select": 0x0020,
+    "l3": 0x0040, "r3": 0x0080,
+    "lb": 0x0100, "rb": 0x0200,
+    "guide": 0x0400,
+    "a": 0x1000, "b": 0x2000, "x": 0x4000, "y": 0x8000,
+}
+
+
+class _XUSB_REPORT(ctypes.Structure):
+    _fields_ = [
+        ("wButtons", ctypes.c_uint16),
+        ("bLeftTrigger", ctypes.c_ubyte),
+        ("bRightTrigger", ctypes.c_ubyte),
+        ("sThumbLX", ctypes.c_int16),
+        ("sThumbLY", ctypes.c_int16),
+        ("sThumbRX", ctypes.c_int16),
+        ("sThumbRY", ctypes.c_int16),
+    ]
+
+
+_VIGEM_LOCK = threading.Lock()
+_VIGEM = {"dll": None, "client": None}
+
+
+def _vigem_dll_candidates():
+    """Where ViGEmClient.dll might live, in load order."""
+    candidates = []
+    base = getattr(sys, "_MEIPASS", None)  # PyInstaller onefile extract dir
+    if base:
+        candidates.append(os.path.join(base, "ViGEmClient.dll"))
+    candidates.append(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "ViGEmClient.dll"))
+    candidates.append("ViGEmClient.dll")  # PATH / System32
+    return candidates
+
+
+def _vigem_load_dll():
+    """Load ViGEmClient.dll (no client connect), or None if not found. A
+    side-effect-free presence check for caps; the real client connect happens in
+    _load_vigem()."""
+    for cand in _vigem_dll_candidates():
+        try:
+            return ctypes.CDLL(cand)
+        except OSError:
+            continue
+    return None
+
+
+def vigem_available():
+    """True when ViGEmClient.dll loads. A hint (the ViGEmBus driver could still
+    be down); the gamepad WS connect is the ground-truth check. Do NOT use this
+    for the `gamepad` capability — use vigem_ready(), which probes the bus."""
+    try:
+        return _vigem_load_dll() is not None
+    except Exception:
+        return False
+
+
+# Ground-truth gamepad-cap probe, cached. `vigem_available()` (DLL-only) is a
+# FALSE POSITIVE on a box where the installer dropped ViGEmClient.dll but the
+# ViGEmBus *driver* did not install (kernel drivers fail silently far more often
+# than a DLL copy). The app trusts caps.gamepad to decide whether to open the
+# pad; a false positive means it opens /ws/gamepad, the agent's vigem_connect
+# fails 0xE0000001, and the pad screen wedges (a client-reported crash loop,
+# 2026-09-17). So gamepad availability must reflect an ACTUAL bus connect.
+#
+# Cheap + self-healing: _load_vigem() alloc+connects the shared client (it does
+# NOT add a virtual target — no phantom pad appears at probe time) and caches it
+# on success. Cache the boolean with a short TTL so /api/status (reachability-
+# critical, must never block) isn't reconnecting every poll, and so a driver
+# installed AFTER the agent started heals within one TTL instead of needing a
+# restart. Never raises.
+_GAMEPAD_CAP = {"at": 0.0, "ok": None, "ttl": 30.0}
+_GAMEPAD_CAP_LOCK = threading.Lock()
+
+
+def vigem_ready():
+    """True only if ViGEmClient.dll loads AND the ViGEmBus driver accepts a
+    connection. Backs the `gamepad` capability. Cached (TTL); never raises."""
+    now = time.monotonic()
+    with _GAMEPAD_CAP_LOCK:
+        c = _GAMEPAD_CAP
+        if c["ok"] is not None and now - c["at"] <= c["ttl"]:
+            return c["ok"]
+        c["at"] = now
+    ok = False
+    try:
+        _load_vigem()  # alloc + connect; raises if the bus driver is down
+        ok = True
+    except Exception:
+        ok = False
+    with _GAMEPAD_CAP_LOCK:
+        _GAMEPAD_CAP["ok"] = ok
+    return ok
+
+
+def _load_vigem():
+    """Load ViGEmClient.dll and connect a shared client (cached on success).
+    Returns (dll, client) or raises RuntimeError with a useful message.
+
+    Failures are NOT latched: a transient one (ViGEmBus not up yet right
+    after boot, DLL dropped in after first use) heals on the next gamepad
+    connection, matching the Linux agent's retry-per-session uinput open.
+    """
+    with _VIGEM_LOCK:
+        if _VIGEM["client"] is not None:
+            return _VIGEM["dll"], _VIGEM["client"]
+        dll = _vigem_load_dll()
+        if dll is None:
+            raise RuntimeError(
+                "ViGEmClient.dll not found (install ViGEmBus and place "
+                "ViGEmClient.dll next to the agent)")
+        try:
+            dll.vigem_alloc.restype = ctypes.c_void_p
+            dll.vigem_connect.restype = ctypes.c_uint32
+            dll.vigem_connect.argtypes = [ctypes.c_void_p]
+            dll.vigem_target_x360_alloc.restype = ctypes.c_void_p
+            dll.vigem_target_add.restype = ctypes.c_uint32
+            dll.vigem_target_add.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            dll.vigem_target_x360_update.restype = ctypes.c_uint32
+            dll.vigem_target_x360_update.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, _XUSB_REPORT]
+            dll.vigem_target_remove.restype = ctypes.c_uint32
+            dll.vigem_target_remove.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            dll.vigem_target_free.argtypes = [ctypes.c_void_p]
+            dll.vigem_disconnect.argtypes = [ctypes.c_void_p]
+            dll.vigem_free.argtypes = [ctypes.c_void_p]
+            client = dll.vigem_alloc()
+            if not client:
+                raise RuntimeError("vigem_alloc failed")
+            err = dll.vigem_connect(client)
+            if err != VIGEM_ERROR_NONE:
+                dll.vigem_free(client)
+                raise RuntimeError(
+                    "vigem_connect failed (0x%08X): is the ViGEmBus driver "
+                    "installed?" % err)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError("ViGEmClient init failed: %s" % e)
+        _VIGEM["dll"] = dll
+        _VIGEM["client"] = client
+        return dll, client
+
+
+def _scale_stick(f):
+    return max(-32768, min(32767, int(round(f * 32767))))
+
+
+# ONE persistent ViGEmBus target, reused by every gamepad connection. Only ever
+# one virtual pad is active (single-controller model), so a single target that
+# lives for the agent's lifetime is all that's needed — and it avoids the
+# per-connection alloc/add + remove/free churn that exhausted ViGEmBus (its
+# target_remove is async; ~100 rapid reconnects outran it -> vigem_target_add
+# failures -> 500s). The OS reclaims it on process exit.
+_VIGEM_TARGET = None
+_VIGEM_TARGET_LOCK = threading.Lock()
+
+
+def _vigem_shared_target(dll, client):
+    """Get (allocating once) the persistent shared ViGEm target."""
+    global _VIGEM_TARGET
+    with _VIGEM_TARGET_LOCK:
+        if _VIGEM_TARGET is None:
+            t = dll.vigem_target_x360_alloc()
+            if not t:
+                raise RuntimeError("vigem_target_x360_alloc failed")
+            err = dll.vigem_target_add(client, t)
+            if err != VIGEM_ERROR_NONE:
+                dll.vigem_target_free(t)
+                raise RuntimeError("vigem_target_add failed (0x%08X)" % err)
+            _VIGEM_TARGET = t
+        return _VIGEM_TARGET
+
+
+class ViGEmGamepad:
+    """Virtual Xbox 360 pad backed by ViGEmBus. Holds the full XUSB report
+    state; every protocol message mutates the state and pushes one update.
+
+    emit() and destroy() are serialized by a per-device lock: unlike the
+    Linux uinput fd (where a racing write/close worst-cases as a caught
+    EBADF), the target here is a heap pointer freed by native code, and the
+    replace-connection path calls destroy() from ANOTHER thread while the
+    old session thread may still be inside emit(). Without the lock that is
+    a native use-after-free; with it, a destroyed device just raises OSError,
+    which the session loop already handles."""
+
+    name = "ViGEm X360 pad"
+
+    def __init__(self):
+        if not IS_WINDOWS:
+            raise RuntimeError("ViGEm gamepad requires Windows")
+        self._lock = threading.Lock()
+        self._dll, self._client = _load_vigem()
+        self._report = _XUSB_REPORT()
+        # Reuse ONE persistent bus target across all connections (see
+        # _vigem_shared_target). Per-connection alloc/add + remove/free exhausted
+        # ViGEmBus under reconnect churn — target_remove is async, so ~100 rapid
+        # add/removes outran the bus and vigem_target_add started failing (500s).
+        # A persistent target sidesteps that; a session just resets its state.
+        self._target = _vigem_shared_target(self._dll, self._client)
+        self._dead = False
+        # Start neutral: release anything a prior session left held.
+        try:
+            self._dll.vigem_target_x360_update(
+                self._client, self._target, self._report)
+        except Exception:
+            pass
+
+    def emit(self, events):
+        """Apply normalized pad events and push the report.
+        events: [("btn", key, v) | ("trig", "lt"|"rt", 0..255) |
+                 ("stick", "l"|"r", x, y)] with protocol +y = down."""
+        rep = self._report
+        for ev in events:
+            kind = ev[0]
+            if kind == "btn":
+                bit = XUSB_BTN_BITS[ev[1]]
+                if ev[2]:
+                    rep.wButtons |= bit
+                else:
+                    rep.wButtons &= ~bit & 0xFFFF
+            elif kind == "trig":
+                if ev[1] == "lt":
+                    rep.bLeftTrigger = ev[2]
+                else:
+                    rep.bRightTrigger = ev[2]
+            elif kind == "stick":
+                x = _scale_stick(ev[2])
+                y = max(-32768, min(32767, -_scale_stick(ev[3])))  # +y up
+                if ev[1] == "l":
+                    rep.sThumbLX, rep.sThumbLY = x, y
+                else:
+                    rep.sThumbRX, rep.sThumbRY = x, y
+        with self._lock:
+            if self._dead:
+                raise OSError("gamepad device destroyed")
+            err = self._dll.vigem_target_x360_update(
+                self._client, self._target, rep)
+        if err != VIGEM_ERROR_NONE:
+            raise OSError("vigem update failed (0x%08X)" % err)
+
+    def destroy(self):
+        # Persistent target: mark THIS handle dead (so a racing emit from the
+        # old session ends it, same as before) and release all inputs by
+        # pushing a neutral report — but do NOT remove/free the shared target;
+        # that churn is exactly what exhausted ViGEmBus. Idempotent.
+        with self._lock:
+            if self._dead:
+                return
+            self._dead = True
+            try:
+                self._dll.vigem_target_x360_update(
+                    self._client, self._target, _XUSB_REPORT())
+            except Exception:
+                pass
+
+
+class WinMouse:
+    """Virtual mouse via SendInput (no driver needed)."""
+
+    name = "SendInput mouse"
+
+    _BTN_FLAGS = {
+        "l": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        "r": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+        "m": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+    }
+
+    def __init__(self):
+        if not IS_WINDOWS:
+            raise RuntimeError("SendInput mouse requires Windows")
+
+    def emit(self, events):
+        inputs = []
+        for ev in events:
+            kind = ev[0]
+            if kind == "move":
+                inputs.append(_mouse_input(dx=ev[1], dy=ev[2],
+                                           flags=MOUSEEVENTF_MOVE))
+            elif kind == "btn":
+                down_flag, up_flag = self._BTN_FLAGS[ev[1]]
+                inputs.append(_mouse_input(
+                    flags=down_flag if ev[2] else up_flag))
+            elif kind == "wheel":
+                # Protocol dy>0 = scroll up; Windows wheel delta >0 = up too.
+                inputs.append(_mouse_input(
+                    data=ctypes.c_uint32(ev[1] * WHEEL_DELTA & 0xFFFFFFFF).value,
+                    flags=MOUSEEVENTF_WHEEL))
+        _send_inputs(inputs)
+
+    def destroy(self):
+        pass  # nothing persistent to tear down
+
+
+class WinKeyboard:
+    """Virtual keyboard via SendInput. Text goes through KEYEVENTF_UNICODE,
+    which is layout-independent: AltGr characters on non-US layouts, or any
+    script, inject without VkKeyScanW's failure modes (an unsupported char
+    can never kill the WS session). Special keys use real VK codes (with the
+    extended-key flag where needed) so games and the shell see them."""
+
+    name = "SendInput keyboard"
+
+    def __init__(self):
+        if not IS_WINDOWS:
+            raise RuntimeError("SendInput keyboard requires Windows")
+
+    def emit(self, events):
+        inputs = []
+        for ev in events:
+            kind = ev[0]
+            if kind == "text":
+                for ch in ev[1]:
+                    if ch in ("\n", "\r"):
+                        # A real Enter keystroke, not a unicode CR: apps
+                        # expect the key, exactly like the Linux agent.
+                        inputs.append(_key_input(VK_RETURN, True))
+                        inputs.append(_key_input(VK_RETURN, False))
+                    elif ch == "\t":
+                        inputs.append(_key_input(VK_TAB, True))
+                        inputs.append(_key_input(VK_TAB, False))
+                    else:
+                        inputs.extend(_unicode_key_inputs(ch))
+            elif kind == "key":
+                vk = SPECIAL_KEYS[ev[1]]
+                inputs.append(_key_input(vk, True))
+                inputs.append(_key_input(vk, False))
+            elif kind == "chord":
+                # Press modifiers/keys in order, release in reverse — the
+                # standard hotkey shape (e.g. Alt down, Tab down, Tab up, Alt up).
+                for vk in ev[1]:
+                    inputs.append(_key_input(vk, True))
+                for vk in reversed(ev[1]):
+                    inputs.append(_key_input(vk, False))
+        _send_inputs(inputs)
+
+    def destroy(self):
+        pass
+
+
+class MockGamepad:
+    """--mock stand-in: logs decoded events instead of touching ViGEm."""
+
+    name = "mock"
+
+    def emit(self, events):
+        for ev in events:
+            print("[gamepad] %s" % (ev,), flush=True)
+
+    def destroy(self):
+        print("[gamepad] mock destroyed", flush=True)
+
+
+class MockMouse:
+    name = "mock-mouse"
+
+    def emit(self, events):
+        for ev in events:
+            print("[mouse] %s" % (ev,), flush=True)
+
+    def destroy(self):
+        print("[mouse] mock destroyed", flush=True)
+
+
+class MockKeyboard:
+    name = "mock-keyboard"
+
+    def emit(self, events):
+        for ev in events:
+            print("[keyboard] %s" % (ev,), flush=True)
+
+    def destroy(self):
+        print("[keyboard] mock destroyed", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Protocol decoding: one client JSON message -> normalized event list. Same
+# message shapes and validation errors as the Linux agent; only the backend
+# consuming the normalized events differs.
+# ---------------------------------------------------------------------------
+
+
+def gamepad_events(msg):
+    """Decode one gamepad message. Raises ValueError for malformed/unknown
+    messages ("ping" is handled by the caller, not here)."""
+    t = msg.get("t")
+    if t == "b":
+        k = msg.get("k")
+        v = msg.get("v")
+        if v not in (0, 1):
+            raise ValueError("button v must be 0 or 1")
+        if k in XUSB_BTN_BITS:
+            return [("btn", k, v)]
+        raise ValueError("unknown button %r" % (k,))
+    if t == "t":
+        k = msg.get("k")
+        v = msg.get("v")
+        if k not in ("lt", "rt"):
+            raise ValueError("unknown trigger %r" % (k,))
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise ValueError("trigger v must be a number")
+        return [("trig", k, max(0, min(255, int(v))))]
+    if t == "s":
+        k = msg.get("k")
+        x = msg.get("x")
+        y = msg.get("y")
+        if k not in ("l", "r"):
+            raise ValueError("unknown stick %r" % (k,))
+        if (not isinstance(x, (int, float)) or isinstance(x, bool) or
+                not isinstance(y, (int, float)) or isinstance(y, bool)):
+            raise ValueError("stick x/y must be numbers")
+        return [("stick", k, x, y)]
+    raise ValueError("unknown message type %r" % (t,))
+
+
+def _require_int(msg, key):
+    v = msg.get(key)
+    if not isinstance(v, int) or isinstance(v, bool):
+        raise ValueError("%s must be an integer" % key)
+    return v
+
+
+MOUSE_BTN_KEYS = ("l", "r", "m")
+
+
+def mouse_events(msg):
+    """Decode one mouse message ({"t":"m"|"mb"|"mw"}). Raises ValueError."""
+    t = msg.get("t")
+    if t == "m":
+        dx = _require_int(msg, "dx")
+        dy = _require_int(msg, "dy")
+        return [("move", dx, dy)]
+    if t == "mb":
+        k = msg.get("k")
+        v = msg.get("v")
+        if k not in MOUSE_BTN_KEYS:
+            raise ValueError("unknown mouse button %r" % (k,))
+        if v not in (0, 1):
+            raise ValueError("mouse button v must be 0 or 1")
+        return [("btn", k, v)]
+    if t == "mw":
+        dy = _require_int(msg, "dy")
+        return [("wheel", dy)]
+    raise ValueError("unknown mouse message type %r" % (t,))
+
+
+def keyboard_events(msg):
+    """Decode one keyboard message ({"t":"kt","text":...} or
+    {"t":"k","key":...}). Text characters inject as KEYEVENTF_UNICODE in the
+    device, so any character is deliverable; only unknown special-key names
+    are rejected here."""
+    t = msg.get("t")
+    if t == "kt":
+        text = msg.get("text")
+        if not isinstance(text, str):
+            raise ValueError("kt text must be a string")
+        return [("text", text)]
+    if t == "k":
+        key = msg.get("key")
+        if key in KEY_CHORDS:
+            return [("chord", KEY_CHORDS[key])]
+        if key not in SPECIAL_KEYS:
+            raise ValueError("unknown special key %r" % (key,))
+        return [("key", key)]
+    raise ValueError("unknown keyboard message type %r" % (t,))
+
+
+# ---------------------------------------------------------------------------
+# Minimal RFC6455 WebSocket support (server side, no fragmentation)
+# ---------------------------------------------------------------------------
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_OP_TEXT, WS_OP_CLOSE, WS_OP_PING, WS_OP_PONG = 0x1, 0x8, 0x9, 0xA
+WS_MAX_FRAME = 1 << 20
+
+
+def ws_try_parse(buf):
+    """Try to parse one complete frame from the front of buf (bytearray).
+    Returns (opcode, payload) and consumes the bytes, or None if more data is
+    needed. Raises ValueError on protocol violations."""
+    if len(buf) < 2:
+        return None
+    b0, b1 = buf[0], buf[1]
+    if not (b0 & 0x80) or (b0 & 0x0F) == 0:
+        raise ValueError("fragmented frames not supported")
+    if b0 & 0x70:
+        raise ValueError("RSV bits set")
+    if not (b1 & 0x80):
+        raise ValueError("client frames must be masked")
+    length = b1 & 0x7F
+    idx = 2
+    if length == 126:
+        if len(buf) < 4:
+            return None
+        length = int.from_bytes(buf[2:4], "big")
+        idx = 4
+    elif length == 127:
+        if len(buf) < 10:
+            return None
+        length = int.from_bytes(buf[2:10], "big")
+        idx = 10
+    if length > WS_MAX_FRAME:
+        raise ValueError("frame too large")
+    end = idx + 4 + length
+    if len(buf) < end:
+        return None
+    mask = buf[idx:idx + 4]
+    payload = bytearray(buf[idx + 4:end])
+    for i in range(length):
+        payload[i] ^= mask[i & 3]
+    opcode = b0 & 0x0F
+    del buf[:end]
+    return opcode, bytes(payload)
+
+
+def ws_recv_frame(conn, buf):
+    """Return the next (opcode, payload) frame, buffering partial TCP reads.
+    Returns None if the socket is dead. Raises ValueError on violations."""
+    while True:
+        frame = ws_try_parse(buf)
+        if frame is not None:
+            return frame
+        try:
+            chunk = conn.recv(4096)
+        except (TimeoutError, OSError):
+            return None
+        if not chunk:
+            return None
+        buf.extend(chunk)
+
+
+def ws_send(conn, opcode, payload=b""):
+    n = len(payload)
+    header = bytes([0x80 | opcode])
+    if n < 126:
+        header += bytes([n])
+    elif n < (1 << 16):
+        header += bytes([126]) + n.to_bytes(2, "big")
+    else:
+        header += bytes([127]) + n.to_bytes(8, "big")
+    conn.sendall(header + payload)
+
+
+def ws_send_json(conn, obj):
+    ws_send(conn, WS_OP_TEXT, json.dumps(obj).encode("utf-8"))
+
+
+# Single active gamepad connection: a new valid connection replaces the old
+# one (old virtual pad destroyed first, then its socket closed).
+# ---------------------------------------------------------------------------
+# Gamepad / mouse / keyboard sessions with CONSENT HANDOFF (parity with the
+# Linux agent, 2.9.2+). A phone either takes control (handoff=takeover, the
+# pre-2.9.2 default) or asks the current holder to pass it (handoff=ask): the
+# holder is prompted and taps Pass/Keep, a demoted phone can Request control
+# back, and Force after a client-side timeout. All state changes happen under
+# GAMEPAD_LOCK; each entry carries its own SEND lock ("slock") because control
+# frames (released/control_request/…) are sent to a socket from a DIFFERENT
+# thread than the one running that session's recv loop, and two threads writing
+# one socket unsynchronised would interleave WS frames.
+#
+# Windows specifics vs. the Linux agent:
+#   * ViGEm creation is instant and the churn fix keeps ONE persistent shared
+#     pad target, so there is no uinput enumeration-settle window to pre-warm
+#     around — but pre-creating mouse/keyboard keeps the frame path identical.
+#   * text always injects via KEYEVENTF_UNICODE, so hello advertises "unicode"
+#     and there is no clipboard-paste ("kt") special case.
+#   * input-injection failures are NON-FATAL (see _note_input_error): SendInput
+#     is refused on the lock/secure desktop etc., which must not kill the pad.
+GAMEPAD_LOCK = threading.Lock()
+GAMEPAD_HOLDER = None      # the entry that currently owns input devices, or None
+GAMEPAD_SESSIONS = []      # every live entry (holder + waiters)
+
+
+def _wsend_json(entry, obj):
+    """Send one JSON text frame to a session, serialised per-socket. Never raises."""
+    with entry["slock"]:
+        try:
+            ws_send_json(entry["conn"], obj)
+        except OSError:
+            pass
+
+
+def _wsend_op(entry, opcode, payload=b""):
+    """Send one raw WS frame to a session, serialised per-socket. Never raises."""
+    with entry["slock"]:
+        try:
+            ws_send(entry["conn"], opcode, payload)
+        except OSError:
+            pass
+
+
+# Box-driven keepalive. Parity with the Linux agent's _gamepad_keepalive_loop:
+# the app's own {"t":"ping"} rides a JS setInterval iOS freezes when the app
+# idles, so the box PINGs each session and the phone OS auto-PONGs below the JS
+# layer, resetting the recv loop's idle clock. The Windows recv loop's idle
+# window is a roomier 60s (vs Linux 12s), so this is defence-in-depth here rather
+# than the acute fix it is on Linux. 4s keeps many pings inside that window.
+GAMEPAD_PING_INTERVAL_S = 4.0
+
+
+def _gamepad_keepalive_tick():
+    """PING every live session; the phone OS auto-PONG keeps the socket's idle
+    clock fresh independent of the app's (freezable) JS keepalive. Snapshots the
+    list under the lock, sends outside it. Never raises (each _wsend_op is
+    self-contained). Split out so a test can drive one tick deterministically."""
+    with GAMEPAD_LOCK:
+        entries = list(GAMEPAD_SESSIONS)
+    for entry in entries:
+        _wsend_op(entry, WS_OP_PING)
+
+
+def _gamepad_keepalive_loop():
+    """Forever: PING every live session every GAMEPAD_PING_INTERVAL_S. Daemon
+    thread started in main(); guarded so it can never take the agent down."""
+    while True:
+        time.sleep(GAMEPAD_PING_INTERVAL_S)
+        try:
+            _gamepad_keepalive_tick()
+        except Exception:  # a keepalive must never die on a transient send error
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Foreground-window + caret watcher (Windows). Two producers share one ~0.35s
+# poll of the foreground window, both pushed to the HOLDER only (a waiter cannot
+# type, and foreground is just context for the one driving):
+#
+#   1. CARET / text-field focus -> {"t":"osk"} EDGE-TRIGGERED on not-focused ->
+#      focused. This is EXACT parity with the Linux agent's _osk_notify
+#      (agent/couchsided.py): the app's onOsk (app/app/(tabs)/pad.tsx) raises the
+#      pad keyboard so the phone types into the focused Win32 field. No protocol
+#      or caps change -- {"t":"osk"} is an existing outbound push the app already
+#      handles (gamepad.ts msg.t === 'osk'); Linux only lacked a Windows producer.
+#      GetGUIThreadInfo(0, &g) reports the FOREGROUND thread's caret; a field is
+#      focused when g.hwndCaret is non-null OR (g.flags & GUI_CARETBLINKING).
+#      LIMIT, documented not a bug: many apps and most browsers draw their own
+#      caret and report NONE through this API, so auto-raise fires for native
+#      Win32 fields (Notepad, Explorer rename, common dialogs, Win32 edit
+#      controls) and is silent elsewhere. (Recipe adapted to stdlib ctypes from
+#      civercras/pc-remote-app "Mando" caret_active; no third-party dep added.)
+#
+#   2. FOREGROUND app -> {"t":"foreground","title":str,"exe":str}, pushed
+#      ON-CHANGE. ADDITIVE outbound frame with no required app consumer yet (the
+#      app ignores unknown t), groundwork for per-app smart buttons (ROADMAP).
+#      GetForegroundWindow -> GetClassNameW filter (skip the two taskbar windows;
+#      special-case the desktop host) -> GetWindowTextW title + PID->exe basename
+#      via OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)+QueryFullProcessImageNameW.
+#
+# Pure stdlib ctypes/user32, DEGRADES CLOSED: every probe returns None/"" on any
+# failure or off Windows, a None tick pushes nothing and leaves last-state
+# untouched, and the loop never raises out of its thread. The argtypes/restype
+# pinning is load-bearing on 64-bit Windows (see _process_privilege): without it
+# ctypes assumes 32-bit c_int and truncates the HWND/handle pointers.
+# ---------------------------------------------------------------------------
+FG_POLL_INTERVAL_S = 0.35
+GUI_CARETBLINKING = 0x1
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+# Window classes that are never a "foreground app": the primary + per-monitor
+# taskbar. A tick that lands on one pushes nothing (holder keeps its last app).
+_FG_SKIP_CLASSES = frozenset(("Shell_TrayWnd", "Shell_SecondaryTrayWnd"))
+# The desktop itself (Program Manager / the wallpaper host WorkerW) -- reported
+# as a named app rather than skipped, so "I'm on the desktop" is a real state.
+_FG_DESKTOP_CLASSES = frozenset(("Progman", "WorkerW"))
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("hwndActive", ctypes.c_void_p),
+        ("hwndFocus", ctypes.c_void_p),
+        ("hwndCapture", ctypes.c_void_p),
+        ("hwndMenuOwner", ctypes.c_void_p),
+        ("hwndMoveSize", ctypes.c_void_p),
+        ("hwndCaret", ctypes.c_void_p),
+        ("rcCaret", ctypes.c_long * 4),  # RECT (left, top, right, bottom)
+    ]
+
+
+def _caret_field_focused(hwnd_caret, flags):
+    """A text field is focused when the foreground thread owns a caret
+    (hwndCaret non-null) OR the caret is blinking (GUI_CARETBLINKING). Pure --
+    no ctypes, so a test drives it on any platform. Mirrors Mando's caret_active."""
+    return bool(hwnd_caret) or bool(flags & GUI_CARETBLINKING)
+
+
+def _fg_classify(class_name):
+    """Map a window class to 'skip' (taskbar), 'desktop', or 'window'. Pure.
+    An unknown or empty class is a real app we simply don't special-case -> 'window'."""
+    if class_name in _FG_SKIP_CLASSES:
+        return "skip"
+    if class_name in _FG_DESKTOP_CLASSES:
+        return "desktop"
+    return "window"
+
+
+def _exe_basename(path):
+    """Last path component of a Windows image path, split on BOTH separators.
+    Pure -- and deliberately not os.path.basename, which ignores backslashes off
+    Windows, so the unit test (run on POSIX) would miss the real split. '' for a
+    falsy path."""
+    if not path:
+        return ""
+    s = str(path)
+    s = s.rsplit("\\", 1)[-1]
+    s = s.rsplit("/", 1)[-1]
+    return s
+
+
+def _fg_exe_for_pid(pid):
+    """exe basename for a pid via OpenProcess(QUERY_LIMITED)+QueryFullProcessImageNameW.
+    '' on any failure (degrade closed). Always closes the handle it opened."""
+    if not pid or not IS_WINDOWS or _kernel32 is None:
+        return ""
+    try:
+        _kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                          ctypes.c_uint32]
+        _kernel32.OpenProcess.restype = ctypes.c_void_p
+        h = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(32768)  # MAX extended path
+            size = ctypes.c_uint32(32768)
+            _kernel32.QueryFullProcessImageNameW.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p,
+                ctypes.POINTER(ctypes.c_uint32)]
+            _kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+            if _kernel32.QueryFullProcessImageNameW(h, 0, buf,
+                                                    ctypes.byref(size)):
+                return _exe_basename(buf.value)
+            return ""
+        finally:
+            _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            _kernel32.CloseHandle(h)
+    except Exception:
+        return ""
+
+
+def _caret_query():
+    """True/False whether the foreground thread has a focused text field, or
+    None when unknown (degrade closed). GetGUIThreadInfo(0, ...) targets the
+    foreground thread. Never raises."""
+    if not IS_WINDOWS or _user32 is None:
+        return None
+    try:
+        gti = _GUITHREADINFO()
+        gti.cbSize = ctypes.sizeof(gti)
+        _user32.GetGUIThreadInfo.argtypes = [ctypes.c_uint32,
+                                             ctypes.POINTER(_GUITHREADINFO)]
+        _user32.GetGUIThreadInfo.restype = ctypes.c_int
+        if not _user32.GetGUIThreadInfo(0, ctypes.byref(gti)):
+            return None
+        return _caret_field_focused(gti.hwndCaret, gti.flags)
+    except Exception:
+        return None
+
+
+def _fg_query():
+    """Foreground window as {'title': str, 'exe': str}, or None when there is no
+    reportable foreground (taskbar, no window) or any probe fails. Never raises."""
+    if not IS_WINDOWS or _user32 is None or _kernel32 is None:
+        return None
+    try:
+        _user32.GetForegroundWindow.restype = ctypes.c_void_p
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        cls = ctypes.create_unicode_buffer(256)
+        _user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                          ctypes.c_int]
+        _user32.GetClassNameW(hwnd, cls, 256)
+        kind = _fg_classify(cls.value)
+        if kind == "skip":
+            return None
+        if kind == "desktop":
+            return {"title": "Desktop", "exe": "explorer.exe"}
+        title = ctypes.create_unicode_buffer(512)
+        _user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                           ctypes.c_int]
+        _user32.GetWindowTextW(hwnd, title, 512)
+        pid = ctypes.c_uint32(0)
+        _user32.GetWindowThreadProcessId.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return {"title": title.value, "exe": _fg_exe_for_pid(pid.value)}
+    except Exception:
+        return None
+
+
+def _fg_notify_osk():
+    """Tell the CURRENT holder its box just focused a text field. Holder only --
+    a waiter cannot type. Best-effort (_wsend_json never raises). Parity with the
+    Linux agent's _osk_notify."""
+    with GAMEPAD_LOCK:
+        holder = GAMEPAD_HOLDER
+    if holder is not None:
+        _wsend_json(holder, {"t": "osk"})
+
+
+def _fg_notify_foreground(info):
+    """Push the current foreground app to the holder as an additive frame."""
+    with GAMEPAD_LOCK:
+        holder = GAMEPAD_HOLDER
+    if holder is not None:
+        _wsend_json(holder, {"t": "foreground",
+                             "title": info.get("title", ""),
+                             "exe": info.get("exe", "")})
+
+
+# Watcher state: last caret-focus bool and last (title, exe) key, for the
+# edge/on-change dedup. Module-level so the live loop keeps it across ticks.
+_FG_STATE = {"caret": None, "fg": None}
+
+
+def _fg_watch_tick(caret_fn=_caret_query, fg_fn=_fg_query,
+                   osk_fn=_fg_notify_osk, fg_notify_fn=_fg_notify_foreground,
+                   state=None):
+    """One poll tick. Pushes osk on a not-focused -> focused caret EDGE, and a
+    foreground frame when (title, exe) CHANGES. The probes/pushes and the state
+    dict are injectable so a test drives it deterministically with no Win32.
+    A None probe (degrade closed) pushes nothing and leaves last-state untouched.
+    Split out so one tick can be driven in isolation. Never raises."""
+    st = _FG_STATE if state is None else state
+    caret = caret_fn()
+    if caret is True and st.get("caret") is not True:
+        osk_fn()                     # field just gained focus -> raise keyboard
+    if caret is not None:
+        st["caret"] = caret
+    info = fg_fn()
+    if info is not None:
+        key = (info.get("title", ""), info.get("exe", ""))
+        if key != st.get("fg"):
+            st["fg"] = key
+            fg_notify_fn(info)
+
+
+def _fg_watch_loop():
+    """Forever: poll the foreground window every FG_POLL_INTERVAL_S. Daemon
+    thread started in main() only on real Windows; guarded so it can never take
+    the agent down."""
+    while True:
+        time.sleep(FG_POLL_INTERVAL_S)
+        try:
+            _fg_watch_tick()
+        except Exception:  # a watcher must never die on a transient probe error
+            pass
+
+
+def _release_devices(entry):
+    """Demote a session that stays connected as a waiter: destroy its gamepad
+    (one pad per holder — the new holder brings its own) but KEEP the mouse and
+    keyboard so regaining control is instant. Mouse buttons are defensively
+    released (a drag could be mid-press at demote; keyboard frames always pair
+    press+release, so keys can never be left held). No settle-window guard is
+    needed as on Linux — SendInput is instant."""
+    dev = entry.get("device")
+    if dev is not None:
+        try:
+            dev.destroy()
+        except Exception:
+            pass
+        entry["device"] = None
+    mouse = entry.get("mouse")
+    if mouse is not None:
+        try:
+            mouse.emit([("btn", b, 0) for b in ("l", "r", "m")])
+        except Exception:
+            pass
+
+
+def _make_holder(entry, mock):
+    # Serialize activation with input emission and ownership changes. A late
+    # activation cannot revive a superseded session.
+    with GAMEPAD_LOCK:
+        if GAMEPAD_HOLDER is not entry:
+            return False
+        return _activate_holder(entry, mock)
+
+
+def _activate_holder(entry, mock):
+    """Grant this session's fixed input mode, then acknowledge with hello.
+
+    Input-only clients share ownership and lifecycle with ordinary pads, but
+    must never load ViGEm or create a controller. Omitted mode stays gamepad.
+    Device creation failure never leaves input enabled on a provisional holder.
+    """
+    input_only = entry.get("mode", "gamepad") == "input"
+    try:
+        if not input_only and entry.get("device") is None:
+            entry["device"] = MockGamepad() if mock else ViGEmGamepad()
+        for slot, factory in (("mouse", MockMouse if mock else WinMouse),
+                              ("keyboard", MockKeyboard if mock else WinKeyboard)):
+            if entry.get(slot) is None:
+                try:
+                    entry[slot] = factory()
+                except Exception:
+                    if input_only:
+                        raise
+                    # Preserve legacy lazy retry for existing controller clients.
+                    print("[gamepad] %s pre-create failed (lazy path will retry)"
+                          % slot, flush=True)
+    except Exception as e:
+        entry["held"] = False
+        _release_devices(entry)
+        print("[gamepad] device create failed: %s" % e, flush=True)
+        _wsend_json(entry, {"t": "err", "msg": "input unavailable" if input_only
+                            else "gamepad unavailable: %s" % e})
+        _wsend_op(entry, WS_OP_CLOSE)
+        try:
+            entry["conn"].shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass
+        return False
+    entry["held"] = True
+    entry["requested"] = False
+    entry["input_err_count"] = 0
+    entry["input_blocked"] = False
+    hello = {"t": "hello", "dev": "input" if input_only else entry["device"].name,
+             "text": "unicode"}
+    if input_only:
+        hello["mode"] = "input"
+    _wsend_json(entry, hello)
+    print("[gamepad] control -> %s" % entry.get("name"), flush=True)
+    return True
+
+
+def _session_mode(query):
+    """An immutable per-connection choice; reject ambiguous or unknown modes."""
+    values = parse_qs(query, keep_blank_values=True).get("mode", ["gamepad"])
+    if len(values) != 1 or values[0] not in ("gamepad", "input"):
+        raise ValueError("mode must be gamepad or input")
+    return values[0]
+
+
+# ---------------------------------------------------------------------------
+# Pairing QR page (GET /pair): LOCALHOST-ONLY, serves the pairing deep link
+# as a QR so the box's own TV can show it.
+#
+# SECURITY: /pair exposes the pairing token in the clear, so it is gated to
+# loopback clients only (see Handler.do_GET). It is NOT under /api and is NOT
+# bearer-authed: the loopback check IS the entire security model.
+#
+# Unlike the Linux agent (which inlines a JS QR encoder), the matrix is
+# rendered SERVER-SIDE from the qr.py module that ships alongside this file;
+# the page only paints the precomputed modules to a canvas. Same offline
+# guarantee, no duplicated encoder.
+# ---------------------------------------------------------------------------
+
+
+def _pair_hostname():
+    """Short hostname + .local for the pairing deep link (Windows 10+ answers
+    mDNS for <hostname>.local out of the box)."""
+    host = socket.gethostname().split(".")[0] or "localhost"
+    return host + ".local"
+
+
+def _pair_lan_ip():
+    """Best-effort primary LAN IP for the pairing deep link's &ip= fallback.
+    UDP connect() picks the interface the default route would use without
+    sending a single packet."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("192.0.2.1", 9))  # TEST-NET-1: never actually sent
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        return None if ip.startswith("127.") else ip
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# PIN pairing (POST /api/pair/start, /api/pair/finish) — parity with the Linux
+# agent. These are the only UNAUTHENTICATED POST routes, because a phone that
+# has just discovered this box has no token yet; the box proves consent by
+# showing a PIN on ITS OWN screen, which only someone who can see that screen
+# can read.
+#
+# Before this existed the Windows agent had no PIN flow at all, so the app's
+# "Scan for boxes -> tap the box" path hit the bearer gate and answered
+# 401 unauthorized. Pairing a Windows box was only possible via the QR page or
+# by typing the token by hand (issue #256).
+#
+# The bounds below are what make an unauthenticated endpoint safe and are
+# copied deliberately from the Linux agent — do not relax them:
+#   TTL             a PIN dies on its own
+#   MAX_ATTEMPTS    a wrong PIN burns the session, so it cannot be brute-forced
+#                   (5 tries against 1e6 PINs)
+#   START_DEBOUNCE  a repeat /start cannot spam the screen or reroll the number
+#                   the user is currently reading
+PAIR_PIN_TTL = 120           # seconds a displayed PIN stays valid
+PAIR_PIN_MAX_ATTEMPTS = 5    # wrong PINs before the session is burned
+PAIR_PIN_START_DEBOUNCE = 3  # min seconds between /start (anti on-screen spam)
+PAIR_PIN_LOCK = threading.Lock()
+PAIR_PIN = None              # {pin, expires, attempts, started} or None
+
+
+def pair_pin_start(show_identity=False):
+    """Mint a fresh PIN + session (replacing any prior one) and return
+    (pin, ttl, fresh). Debounced: within PAIR_PIN_START_DEBOUNCE of the last
+    start the LIVE pin is returned unchanged, so a double-tap doesn't reroll the
+    number already on screen. `fresh` is True only when a NEW PIN was minted, so
+    the caller pops the box screen only then."""
+    global PAIR_PIN
+    with PAIR_PIN_LOCK:
+        now = time.monotonic()
+        s = PAIR_PIN
+        if s and now <= s["expires"] and now - s["started"] < PAIR_PIN_START_DEBOUNCE:
+            if show_identity:
+                s["show_identity"] = True
+            return s["pin"], int(s["expires"] - now), False
+        pin = "%06d" % (int.from_bytes(os.urandom(3), "big") % 1000000)
+        PAIR_PIN = {"pin": pin, "expires": now + PAIR_PIN_TTL,
+                    "attempts": 0, "started": now, "show_identity": bool(show_identity)}
+        return pin, PAIR_PIN_TTL, True
+
+
+def pair_pin_active():
+    """The current PIN if a session is live (for /pair to render), else None."""
+    with PAIR_PIN_LOCK:
+        if PAIR_PIN and time.monotonic() <= PAIR_PIN["expires"]:
+            return PAIR_PIN["pin"]
+        return None
+
+
+def pair_pin_check(pin):
+    """Validate a submitted PIN. True (and burns the session) on match; raises
+    ValueError with a user-facing reason on no-session / expired / locked /
+    wrong. A wrong guess counts toward the attempt cap."""
+    global PAIR_PIN
+    with PAIR_PIN_LOCK:
+        s = PAIR_PIN
+        if not s or time.monotonic() > s["expires"]:
+            PAIR_PIN = None
+            raise ValueError("no active pairing - start it again from the app")
+        if s["attempts"] >= PAIR_PIN_MAX_ATTEMPTS:
+            PAIR_PIN = None
+            raise ValueError("too many wrong PINs - start again")
+        # Untrusted input from an unauthenticated route: REJECT a non-string
+        # rather than coerce it (§3.6). `(pin or "").strip()` raised
+        # AttributeError on any truthy non-string, which surfaced as a 500.
+        # Kept in lockstep with agent/couchsided.py pair_pin_check.
+        if not isinstance(pin, str) or pin.strip() != s["pin"]:
+            s["attempts"] += 1
+            raise ValueError("wrong PIN")
+        PAIR_PIN = None                       # consume on success
+        return True
+
+
+_BOX_POP_LOCK = threading.Lock()
+_BOX_POP_AT = [0.0]                 # monotonic time of the last box-screen pop
+_BOX_POP_COOLDOWN = 5.0             # hard floor between pops
+
+
+def pair_show_on_box(port):
+    """Open the loopback /pair page on THIS machine's screen so the PIN is
+    visible there. Best-effort and detached: pairing must never fail because a
+    browser would not open. Rate-limited so a retry storm cannot throw windows
+    at the user."""
+    with _BOX_POP_LOCK:
+        now = time.monotonic()
+        if now - _BOX_POP_AT[0] < _BOX_POP_COOLDOWN:
+            return
+        _BOX_POP_AT[0] = now
+    url = "http://localhost:%d/pair" % port
+
+    def go():
+        try:
+            # os.startfile is the Windows "open with the default handler" call;
+            # it returns immediately and does not need a shell.
+            os.startfile(url)          # noqa: S606  (Windows-only, fixed URL)
+        except Exception:
+            try:
+                subprocess.Popen(["cmd", "/c", "start", "", url],
+                                 stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 creationflags=_DETACH_FLAGS)
+            except Exception:
+                pass
+    threading.Thread(target=go, daemon=True).start()
+
+
+def build_pair_url(token, port):
+    """The Couchside pairing link (same format as the Linux agent: params ride
+    the URL #FRAGMENT so browsers never send the token to any server)."""
+    from urllib.parse import quote
+    url = "https://couchside.tv/pair#host=%s&port=%d&token=%s" % (
+        quote(_pair_hostname(), safe=""), port, quote(token, safe=""))
+    ip = _pair_lan_ip()
+    if ip:
+        url += "&ip=" + quote(ip, safe="")
+    adv = _tls_public()
+    if adv:
+        url += "&tlsport=%d&fp=%s" % (adv['port'], adv['fp'])
+    return url
+
+
+def render_pin_page(pin, show_identity=False):
+    """Full-screen dark page showing the pairing PIN, sized to be read from a
+    couch. Served ONLY on loopback (the /pair gates), so the PIN is visible only
+    to someone physically at this PC — that is the whole consent mechanism.
+
+    Polls /api/pair/status and clears itself once the session ends (paired or
+    expired) rather than leaving a stale number on screen. A fetch error leaves
+    the page untouched: an agent restart must never paint an error here."""
+    identity = ""
+    fp = _tls_public().get("fp", "")
+    if show_identity and isinstance(fp, str) and re.fullmatch(r"[0-9a-fA-F]{64}", fp):
+        code = " ".join(fp[:32].upper()[i:i+4] for i in range(0, 32, 4))
+        identity = ('<div class="sub" id="identity">PC identity: <strong>' + code +
+                    '</strong><br>Confirm this matches Computer Connect before entering the PIN.</div>')
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>Pair Couchside</title><style>"
+        "html,body{height:100%;margin:0;background:#0b1220;color:#e6edf3;"
+        "font-family:system-ui,Segoe UI,sans-serif;display:flex;align-items:center;"
+        "justify-content:center;text-align:center}"
+        ".w{padding:24px}h1{font-size:1.4rem;font-weight:600;color:#9fb0c0;margin:0 0 18px}"
+        ".pin{font-size:22vw;line-height:1;letter-spacing:.12em;font-weight:700;"
+        "font-variant-numeric:tabular-nums;color:#34d399}"
+        ".sub{margin-top:20px;color:#7d8da0;font-size:1rem}"
+        ".done{font-size:2rem;color:#9fb0c0}"
+        "</style></head><body><div class=\"w\">" +
+        ("<h1>Enter this PIN in Computer Connect</h1>" if show_identity else
+         "<h1>Enter this PIN on your phone</h1>") +
+        "<div class=\"pin\" id=\"pin\">" + pin + "</div>"
+        + identity +
+        "<div class=\"sub\" id=\"sub\">Couchside &middot; pairing expires in 2 minutes</div>"
+        "</div><script>(function(){var gone=false;setInterval(function(){"
+        "fetch('/api/pair/status').then(function(r){return r.json()})"
+        ".then(function(d){if(d&&d.active===false&&!gone){gone=true;"
+        "document.getElementById('pin').outerHTML="
+        "'<div class=\"done\">Pairing finished &mdash; you can close this.</div>';"
+        "document.getElementById('sub').textContent='';}}).catch(function(){});"
+        "},3000);})();</script></body></html>")
+
+
+# ---- LAN discovery responder (lets the app find this box) ------------------
+# The app broadcasts COUCHSIDE_DISCOVER_MAGIC to this UDP port; the box replies
+# with its identity + HTTP port so the app can list it in "Scan for boxes" (then
+# PIN-pair, above). Bound on the SAME number as the HTTP port (UDP vs TCP, no
+# clash). Reveals existence + hostname + version only — no token, no control.
+#
+# The app's other probe, an HTTP sweep of the phone's /24 for /api/ping, already
+# finds this agent; this is the fast path, and the one that works on Android
+# where UDP broadcast beats mDNS multicast RX (no MulticastLock dance). Verbatim
+# behaviour from the Linux agent so one app build treats both boxes alike.
+COUCHSIDE_DISCOVER_MAGIC = b"COUCHSIDE_DISCOVER?"
+
+
+def _udp_discovery_responder(port):
+    """Answer LAN discovery probes on UDP <port>. Best-effort daemon; a bind
+    failure just disables discovery (the app can still find the box by the HTTP
+    sweep, or have one added by IP)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+    except OSError as e:
+        print("[discover] responder disabled: %s" % e, flush=True)
+        return
+    print("[discover] UDP responder on :%d" % port, flush=True)
+    while True:
+        try:
+            data, addr = s.recvfrom(256)
+        except OSError:
+            continue
+        if not data.startswith(COUCHSIDE_DISCOVER_MAGIC):
+            continue
+        short = socket.gethostname().split(".")[0] or "couchside"
+        payload = {"couchside": True, "name": short,
+                   "host": short + ".local", "port": port, "version": VERSION}
+        # A VPN return path can select its tunnel IP even for a LAN probe.
+        # Advertise the same primary LAN address used by on-box pairing instead.
+        lan_ip = _pair_lan_ip()
+        if lan_ip:
+            payload['ip'] = lan_ip
+        adv = _tls_public()
+        if adv:
+            payload.update(tls_port=adv['port'], tls_fp=adv['fp'], tls_spki=adv['spki'])
+        reply = json.dumps(payload).encode()
+        try:
+            s.sendto(reply, addr)
+        except OSError:
+            pass
+
+
+def _qr_matrix_js(text):
+    """(matrix_js, err_js): the QR for `text` as a JSON array of "0101" row
+    strings, ready to inline. Unlike the Linux agent (which ships a JS encoder
+    and encodes in the browser), this agent encodes SERVER-SIDE with qr.py and
+    the page only paints the modules — same offline guarantee, no duplicated
+    encoder. Never raises: a failure becomes the error string the page shows."""
+    if qrmod is None:
+        return "null", json.dumps("QR module missing (qr.py)")
+    try:
+        model = qrmod.build_qr(text)
+        n = model.get_module_count()
+        rows = ["".join("1" if model.is_dark(r, c) else "0"
+                        for c in range(n)) for r in range(n)]
+        return json.dumps(rows), "null"
+    except Exception as e:
+        return "null", json.dumps("QR encode failed: %s" % e)
+
+
+def render_pair_page(token, port):
+    """Self-contained dark HTML page painting the server-rendered QR matrices.
+    No external resources: works on a box with no internet.
+
+    Deliberately the SAME page as the Linux agent's render_pair_page — same
+    three steps, same animated phone, same wording — because a user who sets up
+    a Windows box and a Steam Deck must not be taught two different flows. The
+    only intentional difference is the encoder (server-side here, see
+    _qr_matrix_js).
+
+    Two QRs, and the small one is the point of step 1: someone who does not
+    have Couchside yet cannot pair at all, and the big deep-link QR is useless
+    to them. It points at couchside.tv/#get, whose hero carries BOTH store
+    badges, so the phone picks its own store instead of the box making someone
+    aim a camera at the right one of two codes."""
+    pair_url = build_pair_url(token, port)
+    url_html = (pair_url.replace("&", "&amp;").replace("<", "&lt;")
+                        .replace(">", "&gt;"))
+    matrix_js, err_js = _qr_matrix_js(pair_url)
+    get_matrix_js, _get_err = _qr_matrix_js("https://couchside.tv/#get")
+    return (
+        "<!doctype html><html lang=\"en\"><head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>Pair Couchside</title>"
+        "<style>"
+        "html,body{margin:0;height:100%;background:#0d0f14;color:#e8ecf3;"
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;}"
+        "body{display:flex;flex-direction:column;align-items:center;"
+        "justify-content:center;text-align:center;padding:4vmin;box-sizing:border-box;}"
+        "h1{font-size:min(5vmin,38px);font-weight:650;margin:0 0 .8vmin;letter-spacing:.2px;}"
+        ".sub{color:#9aa4b2;font-size:min(2.7vmin,18px);margin:0 0 2.4vmin;max-width:46ch;}"
+        # One row: [phone + steps] on the left, QR on the right, fitting ONE
+        # screen with no scroll — this page is read off a TV from the couch.
+        # Sizing mirrors the Linux page (measured there at ~960px render width);
+        # it still wraps to a column on a genuinely narrow display.
+        ".stage{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;"
+        "gap:min(5vmin,44px);max-width:1000px;}"
+        ".left{display:flex;align-items:center;gap:min(3vmin,22px);}"
+        ".steps{display:flex;flex-direction:column;gap:min(2.6vmin,20px);"
+        "text-align:left;max-width:30ch;}"
+        ".step{display:flex;align-items:center;gap:min(2.2vmin,15px);}"
+        ".num{flex:0 0 auto;width:min(5vmin,38px);height:min(5vmin,38px);"
+        "border-radius:50%;background:#1c2430;color:#7dd3fc;font-weight:700;"
+        "font-size:min(2.8vmin,20px);display:flex;align-items:center;"
+        "justify-content:center;}"
+        ".step b{font-size:min(3vmin,20px);font-weight:600;color:#e8ecf3;}"
+        ".step span{display:block;color:#9aa4b2;font-size:min(2.4vmin,15px);margin-top:.3vmin;}"
+        # The store QR under step 1. Small on purpose: a phone reads it up close,
+        # so it can stay compact and leave the one-screen budget to the big code.
+        ".stores{display:flex;gap:min(2.6vmin,18px);margin-top:1.2vmin;}"
+        ".store{display:flex;flex-direction:column;align-items:center;gap:.5vmin;}"
+        ".sqr{background:#fff;border-radius:9px;padding:min(1.1vmin,7px);line-height:0;}"
+        ".sqr canvas{display:block;image-rendering:pixelated;"
+        "width:min(15vmin,104px);height:min(15vmin,104px);}"
+        ".slabel{color:#9aa4b2;font-size:min(2.1vmin,12px);font-weight:600;}"
+        ".card{background:#fff;border-radius:20px;padding:min(3.4vmin,28px);"
+        "box-shadow:0 12px 40px rgba(0,0,0,.5);}"
+        "#qr{display:block;image-rendering:pixelated;width:min(42vmin,300px);"
+        "height:min(42vmin,300px);}"
+        ".cap{color:#9aa4b2;font-size:min(2.2vmin,14px);margin-top:1.4vmin;}"
+        ".url{margin-top:2vmin;color:#5a6472;font-size:min(1.9vmin,12px);"
+        "word-break:break-all;max-width:70ch;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}"
+        ".err{color:#ff6b6b;margin-top:3vmin;font-size:min(3vmin,18px);}"
+        # The animated phone mock: three scenes cross-fade on a 9s loop, 3s each,
+        # driven ONLY by @keyframes so there is no JS to fail.
+        ".phone{flex:0 0 auto;width:min(18vmin,96px);}"
+        ".scene{opacity:0;animation:cs 9s infinite;}"
+        ".scene.b{animation-delay:3s;}.scene.c{animation-delay:6s;}"
+        "@keyframes cs{0%{opacity:0}4%{opacity:1}29%{opacity:1}33%{opacity:0}100%{opacity:0}}"
+        "@media (max-width:820px){.steps{max-width:80vw}.stage{gap:4vmin}}"
+        "</style></head><body>"
+        "<h1>Pair your phone</h1>"
+        "<div class=\"sub\">Get the Couchside app, then follow these three steps "
+        "&mdash; or point your phone&rsquo;s camera at the code to skip ahead.</div>"
+        "<div class=\"stage\">"
+        "<div class=\"left\">"
+        "<svg class=\"phone\" viewBox=\"0 0 120 240\" xmlns=\"http://www.w3.org/2000/svg\" "
+        "aria-hidden=\"true\">"
+        "<rect x=\"4\" y=\"4\" width=\"112\" height=\"232\" rx=\"20\" fill=\"#0b1220\" "
+        "stroke=\"#2b3648\" stroke-width=\"3\"/>"
+        "<rect x=\"12\" y=\"20\" width=\"96\" height=\"200\" rx=\"8\" fill=\"#0f1826\"/>"
+        # Scene A: the app icon, "open Couchside".
+        "<g class=\"scene a\"><rect x=\"38\" y=\"78\" width=\"44\" height=\"44\" rx=\"11\" "
+        "fill=\"#38bdf8\"/><rect x=\"46\" y=\"96\" width=\"28\" height=\"14\" rx=\"4\" "
+        "fill=\"#0b1220\"/><rect x=\"44\" y=\"92\" width=\"6\" height=\"10\" fill=\"#0b1220\"/>"
+        "<rect x=\"70\" y=\"92\" width=\"6\" height=\"10\" fill=\"#0b1220\"/>"
+        "<rect x=\"40\" y=\"134\" width=\"40\" height=\"6\" rx=\"3\" fill=\"#334155\"/></g>"
+        # Scene B: a scan list with one row highlighted, "Setup -> Scan, tap it".
+        "<g class=\"scene b\"><rect x=\"22\" y=\"70\" width=\"76\" height=\"22\" rx=\"6\" "
+        "fill=\"#38bdf8\"/><rect x=\"29\" y=\"78\" width=\"40\" height=\"6\" rx=\"3\" "
+        "fill=\"#0b1220\"/><rect x=\"22\" y=\"100\" width=\"76\" height=\"16\" rx=\"5\" "
+        "fill=\"#1c2430\"/><rect x=\"22\" y=\"124\" width=\"76\" height=\"16\" rx=\"5\" "
+        "fill=\"#1c2430\"/></g>"
+        # Scene C: the six-digit PIN appearing, "a PIN shows here".
+        "<g class=\"scene c\"><rect x=\"24\" y=\"96\" width=\"10\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/><rect x=\"38\" y=\"96\" width=\"10\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/><rect x=\"52\" y=\"96\" width=\"10\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/><rect x=\"66\" y=\"96\" width=\"10\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/><rect x=\"80\" y=\"96\" width=\"10\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/><rect x=\"94\" y=\"96\" width=\"6\" height=\"18\" rx=\"2\" "
+        "fill=\"#7dd3fc\"/></g></svg>"
+        "<div class=\"steps\">"
+        "<div class=\"step\"><div class=\"num\">1</div><div>"
+        "<b>Get Couchside on your phone</b>"
+        "<span>Don&rsquo;t have it? Scan to install on iOS or Android "
+        "&mdash; free.</span>"
+        "<div class=\"stores\">"
+        "<div class=\"store\">"
+        "<div class=\"sqr\"><canvas id=\"qr-get\" width=\"104\" height=\"104\"></canvas></div>"
+        "<div class=\"slabel\">App Store &amp; Google Play</div></div>"
+        "</div></div></div>"
+        "<div class=\"step\"><div class=\"num\">2</div><div>"
+        "<b>Setup tab &rarr; Scan for boxes</b>"
+        "<span>Then tap this box in the list.</span></div></div>"
+        "<div class=\"step\"><div class=\"num\">3</div><div>"
+        "<b>A 6-digit PIN appears here</b>"
+        "<span>Type it into the app to finish.</span></div></div>"
+        "</div>"          # .steps
+        "</div>"          # .left
+        "<div>"
+        "<div class=\"card\"><canvas id=\"qr\" width=\"300\" height=\"300\"></canvas></div>"
+        "<div class=\"cap\">Or scan with your camera</div>"
+        "</div>"
+        "</div>"          # .stage
+        "<div class=\"url\">" + url_html + "</div>"
+        "<div id=\"err\" class=\"err\"></div>"
+        "<script>\n"
+        "(function(){\n"
+        "  var rows = " + matrix_js + ";\n"
+        "  var err = " + err_js + ";\n"
+        "  var getRows = " + get_matrix_js + ";\n"
+        "  function paint(id, rows, box, minpx){\n"
+        "    var canvas = document.getElementById(id);\n"
+        "    if (!canvas || !rows) return;\n"
+        "    var n = rows.length, quiet = 4, total = n + quiet*2;\n"
+        "    var px = Math.max(minpx, Math.floor(box/total));\n"
+        "    var size = total*px; canvas.width = size; canvas.height = size;\n"
+        "    var ctx = canvas.getContext('2d');\n"
+        "    ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,size,size);\n"
+        "    ctx.fillStyle = '#000000';\n"
+        "    for (var r=0;r<n;r++){ for (var c=0;c<n;c++){ if (rows[r].charAt(c)==='1') {\n"
+        "      ctx.fillRect((c+quiet)*px,(r+quiet)*px,px,px); } } }\n"
+        "  }\n"
+        # Only the PAIRING QR's failure is worth a visible error: without it the
+        # camera shortcut is dead. A missing store QR degrades to the printed
+        # steps, so it fails silently rather than shouting on the user's TV.
+        "  if (err || !rows) {\n"
+        "    document.getElementById('err').textContent = err || 'no QR data';\n"
+        "  } else {\n"
+        "    paint('qr', rows, 300, 4);\n"
+        "  }\n"
+        "  paint('qr-get', getRows, 108, 2);\n"
+        # THE HANDOFF, same cadence as render_pin_page: the instant a pairing
+        # starts (active===true) reload, and the /pair route then serves the big
+        # PIN page because pair_pin_active() is now truthy — this idle tutorial
+        # becomes the very thing step 3 was teaching. Errors are swallowed and
+        # the page left alone: an agent restart must never paint a browser error
+        # on the TV. One reload only (the guard), so a slow reload can't stack.
+        "  var gone=false;\n"
+        "  setInterval(function(){\n"
+        "    fetch('/api/pair/status').then(function(r){return r.json()})\n"
+        "    .then(function(d){if(d&&d.active===true&&!gone){gone=true;\n"
+        "      location.reload();}}).catch(function(){});\n"
+        "  },3000);\n"
+        "})();\n"
+        "</script></body></html>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+
+
+
+# HTTPS is additive: legacy controls stay on HTTP; uploads require TLS.
+TLS_ADVERT = None
+_UPLOAD_TICKETS = {}
+_UPLOAD_TICKET_LOCK = threading.Lock()
+_UPLOAD_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _tls_public():
+    return dict(TLS_ADVERT or {})
+
+
+def _ticket_mint():
+    now = time.monotonic()
+    with _UPLOAD_TICKET_LOCK:
+        for k, expiry in list(_UPLOAD_TICKETS.items()):
+            if expiry <= now:
+                del _UPLOAD_TICKETS[k]
+        if len(_UPLOAD_TICKETS) >= 128:
+            raise ValueError("too many outstanding tickets")
+        ticket = secrets.token_hex(16)
+        _UPLOAD_TICKETS[ticket] = now + 120
+    return ticket
+
+
+def _ticket_consume(ticket):
+    with _UPLOAD_TICKET_LOCK:
+        expiry = _UPLOAD_TICKETS.pop(ticket, 0)
+    return expiry > time.monotonic()
+
+
+def _upload_name(name):
+    # Windows paths also have ADS, device aliases, trailing-dot and Unicode
+    # normalization hazards. Accept one literal leaf; never rewrite a bad name.
+    if (not isinstance(name, str) or not name or len(name) > 180
+            or name != name.strip() or name.endswith('.')
+            or any(ord(c) < 32 or c in '<>:"/\\|?*' for c in name)
+            or name in ('.', '..')
+            or name.split('.')[0].rstrip(' ').upper() in
+               {'CON', 'PRN', 'AUX', 'NUL', 'CLOCK$', 'CONIN$', 'CONOUT$'}
+            or re.match(r'^(COM|LPT)([0-9]|[¹²³])$', name.split('.')[0], re.I)):
+        raise ValueError("invalid filename")
+    return name
+
+
+def _drop_dir():
+    # Fixed user destination: never supplied by a network client.
+    root = os.path.join(os.path.expanduser('~'), 'Downloads', 'Couchside')
+    os.makedirs(root, exist_ok=True)
+    return os.path.realpath(root)
+
+
+def _tls_identity(root):
+    # Only certificate generation uses PyCA; sockets and transfers use stdlib.
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    if IS_WINDOWS:
+        who = subprocess.run(['whoami', '/user', '/fo', 'csv', '/nh'],
+                             capture_output=True, text=True, check=True)
+        sid = next(csv.reader(who.stdout.strip().splitlines()))[1]
+        if not re.fullmatch(r'S-1-[0-9-]+', sid):
+            raise ValueError('cannot identify certificate owner')
+        subprocess.run(['icacls', root, '/inheritance:r', '/grant:r',
+                        '*'+sid+':(OI)(CI)F', '*S-1-5-18:(OI)(CI)F'],
+                       capture_output=True, check=True)
+    else:
+        os.chmod(root, 0o700)
+    kp, cp = os.path.join(root, 'key.pem'), os.path.join(root, 'cert.pem')
+    if os.path.exists(kp):
+        key = serialization.load_pem_private_key(Path(kp).read_bytes(), password=None)
+    else:
+        # Never replace a previously trusted identity on a parse failure.
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        fd = os.open(kp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    short = socket.gethostname().split('.')[0]
+    names = [x509.DNSName('localhost'), x509.DNSName(short), x509.DNSName(short+'.local'),
+             x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]
+    ip = _pair_lan_ip()
+    if ip:
+        names.append(x509.IPAddress(ipaddress.ip_address(ip)))
+    cert = None
+    if os.path.exists(cp):
+        cert = x509.load_pem_x509_certificate(Path(cp).read_bytes())
+        existing = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        if (not all(n in existing for n in names)
+                or cert.not_valid_after_utc < datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=7)):
+            cert = None
+    if cert is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'couchside')])
+        cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
+                .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now-datetime.timedelta(minutes=5))
+                .not_valid_after(now+datetime.timedelta(days=3650))
+                .add_extension(x509.SubjectAlternativeName(names), critical=False)
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .add_extension(x509.KeyUsage(True,False,True,False,False,False,False,None,None), critical=True)
+                .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+                .sign(key, hashes.SHA256()))
+        fd, tmp = tempfile.mkstemp(dir=root, prefix='cert-', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(cert.public_bytes(serialization.Encoding.PEM))
+            os.replace(tmp, cp)
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+    public = key.public_key().public_bytes(serialization.Encoding.DER,
+                                           serialization.PublicFormat.SubjectPublicKeyInfo)
+    if cert.public_key().public_bytes(serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo) != public:
+        raise ValueError('certificate/key mismatch')
+    return cp, kp, {'fp': cert.fingerprint(hashes.SHA256()).hex(),
+                    'spki': hashlib.sha256(public).hexdigest(),
+                    'cert': cert.public_bytes(serialization.Encoding.PEM).decode('ascii')}
+
+
+def _start_https(host, port, root):
+    global TLS_ADVERT
+    cp, kp, info = _tls_identity(root)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cp, kp)
+    server = QuietThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
+    try:
+        server.socket = ctx.wrap_socket(server.socket, server_side=True,
+                                       do_handshake_on_connect=False)
+        threading.Thread(target=server.serve_forever, daemon=True, name='https').start()
+    except Exception:
+        server.server_close()
+        raise
+    TLS_ADVERT = dict(info, port=server.server_port)
+    return server
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = APP_NAME + "/" + VERSION
+    protocol_version = "HTTP/1.1"
+
+    # Hard cap on a request body we will read into memory. Enforced BEFORE any
+    # body read (see _read_body) so an unauthenticated LAN client can't force a
+    # huge allocation via a large Content-Length. 8 MiB comfortably covers the
+    # only bodies this agent accepts (tiny launcher/volume/power JSON).
+    timeout = 30
+    MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024
+    MAX_BODY_BYTES = 8 * 1024 * 1024
+
+    # set by main()
+    token = ""
+    token_file = None   # path to re-read the current token for /pair
+    port = DEFAULT_PORT  # advertised in the pairing deep link
+    mock = False
+
+    def log_message(self, fmt, *args):  # route BaseHTTPRequestHandler logs away
+        pass
+
+    def _is_loopback(self):
+        """True iff the connecting client is on the loopback interface. Half
+        the security model for /pair; the peer IP cannot be spoofed by a
+        request header. The other half is _host_header_is_local."""
+        host = self.client_address[0]
+        if host == "::1":
+            return True
+        if host.startswith("::ffff:"):
+            host = host[len("::ffff:"):]
+        return host == "localhost" or host.startswith("127.")
+
+    def _host_header_is_local(self):
+        """True iff the request's Host header names loopback (anti-DNS-
+        rebinding gate for /pair).
+
+        Matched by PARSING, not by prefix: a `startswith("127.")` test used to
+        pass here, but it also accepts a rebindable hostname such as
+        127.0.0.1.evil.com (a name an attacker points at 127.0.0.1), which
+        defeats the gate. ipaddress.ip_address rejects anything that is not a
+        real IP, so only genuine loopback addresses (and the two explicit
+        names) get through. Same fix as the Linux agent (KI-087)."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):
+            host = host[1:].split("]", 1)[0]
+        elif host.count(":") == 1:
+            host = host.rsplit(":", 1)[0]
+        if host in ("localhost", "::1"):
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+
+    def _current_token(self):
+        """The token to advertise on /pair: fresh from the token file if we
+        can read it, else the token loaded at startup."""
+        if self.token_file:
+            try:
+                with open(self.token_file, encoding="utf-8-sig") as f:
+                    tok = f.read().strip()
+                if tok:
+                    return tok
+            except OSError:
+                pass
+        return self.token
+
+    def _send_html(self, code, html, started):
+        body = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+        self._log(code, started)
+
+    # Chatty routes whose success (2xx) is sampled so a ~1-2 fps poll can't
+    # scroll real diagnostics out of the journal's window. Errors and the first
+    # hit of a burst still log.
+    _SAMPLED_PATHS = ("/api/screen/frame",)
+    _sample_last = {}  # path -> monotonic time of last logged success
+    _SAMPLE_EVERY_S = 15
+
+    def _log(self, code, started):
+        dur_ms = int((time.monotonic() - started) * 1000)
+        # Never log query strings: /ws/gamepad carries ?token=<secret>.
+        path = self.path.split("?", 1)[0]
+        if path in self._SAMPLED_PATHS and code < 400:
+            now = time.monotonic()
+            if now - Handler._sample_last.get(path, 0) < self._SAMPLE_EVERY_S:
+                return  # suppress this frame; a recent one already logged
+            Handler._sample_last[path] = now
+        if "?" in self.path:
+            path += "?<redacted>"
+        print("%s %s %s %d %dms" % (
+            self.client_address[0], self.command, path, code, dur_ms),
+            flush=True)
+
+    def _send(self, code, payload, started, extra_headers=None):
+        body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        # No CORS: this is a LAN service for the native app + WS, neither of
+        # which need it; sending ACAO:* let a malicious browser tab read
+        # responses cross-origin.
+        if payload is not None:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+        self._log(code, started)
+
+    def _send_bytes(self, code, data, content_type, started,
+                    cache_control=None, extra_headers=None):
+        """Write a raw binary body (album art, screen frames) with an EXACT
+        Content-Length (keep-alive safety under HTTP/1.1)."""
+        self.send_response(code)
+        # No CORS: this is a LAN service for the native app + WS, neither of
+        # which need it; sending ACAO:* let a malicious browser tab read
+        # responses cross-origin.
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        if cache_control:
+            self.send_header("Cache-Control", cache_control)
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        if data:
+            self.wfile.write(data)
+        self._log(code, started)
+
+
+    def _handle_upload(self, parsed, started):
+        self.close_connection = True  # a rejected/partial body must not be reused
+        try:
+            name = _upload_name((parse_qs(parsed.query).get('name') or [''])[0])
+        except ValueError:
+            self._send(400, {'error': 'invalid filename'}, started)
+            return
+        lengths = self.headers.get_all('Content-Length') or []
+        if self.headers.get('Transfer-Encoding') or len(lengths) != 1 or not re.fullmatch(r'[0-9]+', lengths[0]):
+            self._send(411, {'error': 'one content length required'}, started)
+            return
+        length = int(lengths[0])
+        if not 0 < length <= self.MAX_UPLOAD_BYTES:
+            self._send(413 if length else 411, {'error': 'invalid file size'}, started)
+            return
+        if not _UPLOAD_SLOTS.acquire(blocking=False):
+            self._send(429, {'error': 'uploads busy'}, started)
+            return
+        tmp = None
+        try:
+            root = _drop_dir()
+            dest = os.path.join(root, name)
+            # No overwrites, links, device aliases or automatic execution.
+            if os.path.lexists(dest):
+                self._send(409, {'error': 'file already exists'}, started)
+                return
+            if shutil.disk_usage(root).free < length + 64*1024*1024:
+                self._send(507, {'error': 'not enough free space'}, started)
+                return
+            fd, tmp = tempfile.mkstemp(dir=root, prefix='.couchside-upload-', suffix='.part')
+            written = 0
+            with os.fdopen(fd, 'wb') as f:
+                while written < length:
+                    chunk = self.rfile.read(min(1024*1024, length-written))
+                    if not chunk:
+                        raise ValueError('incomplete upload')
+                    f.write(chunk)
+                    written += len(chunk)
+            # Atomic no-clobber publication: hard-link creation fails if another
+            # transfer/local user created the destination during the stream.
+            os.link(tmp, dest)
+            os.unlink(tmp)
+            tmp = None
+            self._send(200, {'ok': True, 'name': name, 'bytes': written, 'path': dest}, started)
+        except FileExistsError:
+            self._send(409, {'error': 'file already exists'}, started)
+        except (ValueError, TimeoutError):
+            self._send(400, {'error': 'incomplete upload'}, started)
+        except OSError:
+            self._send(500, {'error': 'write failed'}, started)
+        finally:
+            if tmp is not None:
+                try: os.unlink(tmp)
+                except OSError: pass
+            _UPLOAD_SLOTS.release()
+
+    def _authorized(self):
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return False
+        supplied = auth[len("Bearer "):].strip()
+        return hmac.compare_digest(supplied, self.token)
+
+    # -- verbs ---------------------------------------------------------------
+
+    def do_OPTIONS(self):
+        started = time.monotonic()
+        self._send(204, None, started)
+
+    def do_GET(self):
+        started = time.monotonic()
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+
+            if path == "/ws/gamepad":
+                self._handle_gamepad_ws(parsed, started)
+                return
+
+            if path == "/pair":
+                # LOCALHOST-ONLY: two gates, both required (see the Linux
+                # agent's security notes).
+                if not self._is_loopback() or not self._host_header_is_local():
+                    self._send(403, {"error": "forbidden"}, started)
+                    return
+                # While a PIN-pairing session is live, this page IS the
+                # physical-presence proof: show the big PIN (loopback-only, so
+                # only someone at this PC sees it). Otherwise the usual token QR.
+                pin = pair_pin_active()
+                with PAIR_PIN_LOCK:
+                    identity = bool(PAIR_PIN and PAIR_PIN.get("show_identity"))
+                html = (render_pin_page(pin, identity) if pin
+                        else render_pair_page(self._current_token(), self.port))
+                self._send_html(200, html, started)
+                return
+
+            if path == "/api/pair/status":
+                # Loopback-only: the on-screen PIN page polls this to learn when
+                # its session ended (paired or expired) so it can clear itself.
+                # Reveals only a boolean — never the PIN, never the token.
+                if not self._is_loopback():
+                    self._send(403, {"error": "forbidden"}, started)
+                    return
+                self._send(200, {"active": pair_pin_active() is not None}, started)
+                return
+
+            if path == "/api/ping":
+                # "ip" is the LAN address the client actually reached us on;
+                # the app caches it per box as an mDNS fallback. "host" lets
+                # the app verify a cached IP still points at THIS box.
+                try:
+                    own_ip = self.connection.getsockname()[0]
+                except OSError:
+                    own_ip = None
+                short_host = socket.gethostname().split(".")[0] or None
+                resp = {"ok": True, "app": APP_NAME, "version": VERSION,
+                        "ip": own_ip, "host": short_host}
+                adv = _tls_public()
+                if adv:
+                    resp.update(tls_port=adv['port'], tls_fp=adv['fp'], tls_spki=adv['spki'])
+                self._send(200, resp, started)
+                return
+
+            if path == "/api/tls/cert":
+                info = _tls_public()
+                self._send(200 if info else 404, info or {"error": "tls not enabled"}, started)
+                return
+
+            if not path.startswith("/api/"):
+                self._send(404, {"error": "not found"}, started)
+                return
+
+            if not self._authorized():
+                self._send(401, {"error": "unauthorized"}, started)
+                return
+
+            if path == "/api/status":
+                data = mock_status() if self.mock else real_status()
+                data['caps'] = dict(data.get('caps') or {}, file_upload=bool(TLS_ADVERT))
+                self._send(200, data, started)
+            elif path == "/api/units":
+                units = mock_units() if self.mock else real_units()
+                self._send(200, {"units": units}, started)
+            elif path == "/api/journal":
+                self._handle_journal(parsed, started)
+            elif path == "/api/actions":
+                actions = [
+                    {"id": aid,
+                     "label": ACTIONS[aid]["label"],
+                     "description": ACTIONS[aid]["description"],
+                     "danger": ACTIONS[aid]["danger"]}
+                    for aid in ACTION_ORDER
+                ]
+                self._send(200, {"actions": actions}, started)
+            elif path == "/api/launchers":
+                self._send(200, {"launchers": list_launchers(),
+                                 "create_enabled": bool(ALLOW_APP_LAUNCHERS)},
+                           started)
+            elif path == "/api/downloads":
+                # Always 200 (list may be empty). Old agents lack this route and
+                # 404 -> the app hides the section (probe-and-appear).
+                downloads = mock_downloads() if self.mock else steam_downloads()
+                self._send(200, {"downloads": downloads}, started)
+            elif path == "/api/update/check":
+                # Box does the (cached, 6h) GitHub read; the app reads the
+                # result over the LAN and never touches the internet. Force a
+                # fresh check with ?force=1. apply_enabled tells the app whether
+                # POST /api/update/apply is allowed on THIS box.
+                force = parse_qs(parsed.query).get(
+                    "force", ["0"])[0] not in ("0", "", "false")
+                data = mock_update_check() if self.mock else update_check(force)
+                blocker = _self_update_blocker() if ALLOW_APP_UPDATE and not self.mock else None
+                data = dict(data, apply_enabled=bool(ALLOW_APP_UPDATE and not blocker))
+                if blocker:
+                    data["apply_blocked"] = blocker
+                if ALLOW_APP_UPDATE and not self.mock:
+                    # Read-only: last apply attempt (idle/running/launched/
+                    # failed + error) so the app can show why it was refused.
+                    data["apply_state"] = update_apply_state()
+                self._send(200, data, started)
+            elif path == "/api/tv":
+                info = tv_info()
+                if info is None:
+                    self._send(404, {"error": "not found"}, started)
+                else:
+                    self._send(200, info, started)
+            elif path == "/api/media":
+                # Probe-and-appear: 404 when SMTC is unavailable so the app
+                # hides the Now Playing card; 200 with an empty list when idle.
+                info = mock_smtc_info() if self.mock else smtc_info()
+                if info is None:
+                    self._send(404, {"error": "not found"}, started)
+                else:
+                    self._send(200, info, started)
+            elif path == "/api/media/art":
+                # Album art bytes for a player's CURRENT track. The client passes
+                # only player id + art_key (a cache-buster) — never a path.
+                q = parse_qs(parsed.query)
+                player = (q.get("player") or [""])[0]
+                key = (q.get("k") or [""])[0]
+                art = None
+                if player:
+                    art = (mock_smtc_art(player, key) if self.mock
+                           else smtc_art(player, key))
+                if art is None:
+                    self._send(404, {"error": "not found"}, started)
+                else:
+                    data, mime = art
+                    self._send_bytes(200, data, mime, started,
+                                     cache_control="private, max-age=3600")
+            elif path == "/api/screen":
+                # Probe-and-appear: 404 when no capture path so the app hides the
+                # preview card; a body describes the session + backends.
+                info = ({"available": True, "session": "mock",
+                         "backends": ["mock"], "formats": ["image/png"]}
+                        if self.mock else screen_info())
+                if info is None:
+                    self._send(404, {"error": "not found"}, started)
+                else:
+                    self._send(200, info, started)
+            elif path == "/api/screen/frame":
+                # One fresh frame. Single-flight + short cache cap captures
+                # server-side; no-store so frames (may show passwords) are never
+                # cached. High-frequency, so _log samples it.
+                frame = mock_screen_frame() if self.mock else real_screen_frame()
+                if frame is None:
+                    self._send(503, {"error": "capture failed"}, started)
+                else:
+                    data, mime = frame
+                    self._send_bytes(200, data, mime, started,
+                                     cache_control="no-store")
+            elif path == "/api/power/schedule":
+                # Always 200: reports the (volatile) sleep timer + the scheduled
+                # wake. Old agents 404 -> the app hides the rows.
+                self._send(200, power_schedule_info(), started)
+            else:
+                self._send(404, {"error": "not found"}, started)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            try:
+                self._send(500, {"error": e.__class__.__name__}, started)
+            except Exception:
+                pass
+
+    def _body_too_large(self):
+        """True iff the declared Content-Length exceeds MAX_BODY_BYTES.
+
+        Checked from the header alone, BEFORE any read, so a huge declared body
+        is rejected without allocating for it. Callers that hit this must reply
+        413 and close the connection (the body is never drained)."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return False
+        return n > self.MAX_BODY_BYTES
+
+    def _read_body(self):
+        """Read and return the request body bytes (always drains it, so
+        keep-alive connections never desync).
+
+        The size is capped at MAX_BODY_BYTES; callers must gate on
+        _body_too_large() first so an oversize body is rejected before we ever
+        read it. A Content-Length above the cap that slips through here is
+        clamped and the connection marked for close, so we never allocate
+        unbounded."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0:
+            return b""
+        if n > self.MAX_BODY_BYTES:
+            # Defensive: normal paths gate on _body_too_large() before reading.
+            self.close_connection = True
+            n = self.MAX_BODY_BYTES
+        return self.rfile.read(n)
+
+    def do_POST(self):
+        started = time.monotonic()
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/")
+
+            if not path.startswith("/api/"):
+                # Unknown route: authorize-agnostic 404, but drain the body so a
+                # keep-alive connection doesn't desync (unless it's oversize).
+                if self._body_too_large():
+                    self.close_connection = True
+                    self._send(413, {"error": "request body too large"}, started)
+                    return
+                self._read_body()
+                self._send(404, {"error": "not found"}, started)
+                return
+
+            # UNAUTHENTICATED PIN pairing (the only unauthenticated POSTs): a
+            # phone that discovered this box enrolls via a PIN shown on the
+            # box's own screen. Bounded: /start is debounced + displays the PIN
+            # locally; /finish is TTL + attempt-capped and only returns the token
+            # for the correct PIN. Handled here, BEFORE the bearer-token gate —
+            # a phone that has no token yet cannot present one, which is why the
+            # gate used to answer 401 and made scan-and-pair impossible on
+            # Windows (issue #256).
+            if path in ("/api/pair/start", "/api/pair/finish"):
+                if self._body_too_large():
+                    self.close_connection = True
+                    self._send(413, {"error": "request body too large"}, started)
+                    return
+                pair_body = self._read_body()
+                if path == "/api/pair/start":
+                    try:
+                        pairing_options = json.loads(pair_body.decode("utf-8")) if pair_body else {}
+                    except (ValueError, UnicodeDecodeError):
+                        pairing_options = {}
+                    show_identity = (isinstance(pairing_options, dict) and
+                                     pairing_options.get("client") == "computer-connect")
+                    _pin, ttl, fresh = pair_pin_start(show_identity=show_identity)
+                    # Pop the box screen ONLY on a fresh mint: a repeat /start
+                    # inside the debounce window returns the same PIN and must
+                    # not throw another window at whoever is at the PC.
+                    if fresh:
+                        pair_show_on_box(self.port)
+                    adv = _tls_public()
+                    extra = ({'tls_port':adv['port'], 'tls_fp':adv['fp'], 'tls_spki':adv['spki']} if adv else {})
+                    if show_identity:
+                        extra['identity_shown'] = bool(adv)
+                    self._send(200, dict({"ok": True, "ttl": ttl}, **extra), started)
+                    return
+                # .get() OUTSIDE the try: a body that parses but is not an object
+                # ([], "x", 5) raised AttributeError past this tuple and answered
+                # 500 on a pre-auth route. Lockstep with agent/couchsided.py.
+                try:
+                    req = json.loads(pair_body.decode("utf-8")) if pair_body else {}
+                except (ValueError, UnicodeDecodeError):
+                    req = None
+                submitted = req.get("pin") if isinstance(req, dict) else None
+                try:
+                    pair_pin_check(submitted)
+                except ValueError as e:
+                    self._send(403, {"ok": False, "error": str(e)}, started)
+                    return
+                adv = _tls_public()
+                extra = ({'tls_port':adv['port'], 'tls_fp':adv['fp'], 'tls_spki':adv['spki']} if adv else {})
+                self._send(200, dict({"ok": True, "token": self._current_token(),
+                                 "port": self.port}, **extra), started)
+                return
+
+            # Authorize BEFORE reading the body: an unauthenticated client must
+            # not be able to make us allocate for its body. Reject + close so the
+            # undrained body can't desync a keep-alive connection.
+            ticket = (parse_qs(parsed.query).get('ticket') or [''])[0]
+            secure = isinstance(self.connection, ssl.SSLSocket)
+            ticket_ok = (path == '/api/upload' and secure and ticket and _ticket_consume(ticket))
+            if not (self._authorized() or ticket_ok):
+                self.close_connection = True
+                self._send(401, {"error": "unauthorized"}, started)
+                return
+
+            if path in ('/api/upload', '/api/ticket'):
+                if not secure:
+                    self.close_connection = True
+                    self._send(426, {'error': 'HTTPS required'}, started)
+                    return
+                if path == '/api/upload':
+                    self._handle_upload(parsed, started)
+                    return
+                # No request body is needed. Reject malformed framing explicitly.
+                if self.headers.get('Transfer-Encoding') or self.headers.get('Content-Length', '0') != '0':
+                    self.close_connection = True
+                    self._send(400, {'error': 'ticket request must be empty'}, started)
+                    return
+                try:
+                    ticket = _ticket_mint()
+                except ValueError:
+                    self._send(429, {'error': 'too many outstanding tickets'}, started)
+                    return
+                self._send(200, {'ticket': ticket, 'ttl': 120}, started)
+                return
+
+            # Authorized: now enforce the size cap, then read the body.
+            if self._body_too_large():
+                self.close_connection = True
+                self._send(413, {"error": "request body too large"}, started)
+                return
+            body = self._read_body()
+
+            if path == '/api/upload/reveal':
+                try:
+                    root = _drop_dir()
+                    if self.mock:
+                        opened = False
+                    else:
+                        os.startfile(root)
+                        opened = True
+                    self._send(200, {'opened': opened, 'path': root}, started)
+                except OSError:
+                    self._send(200, {'opened': False, 'reason': 'file manager unavailable'}, started)
+                return
+
+            prefix = "/api/actions/"
+            if path.startswith(prefix):
+                action_id = path[len(prefix):]
+                if action_id not in ACTIONS:
+                    self._send(404, {"error": "unknown action"}, started)
+                    return
+                result = (mock_action(action_id) if self.mock
+                          else real_action(action_id))
+                self._send(200, result, started)
+                return
+
+            # POST /api/launchers: add a custom launcher. Gated by
+            # ALLOW_APP_LAUNCHERS (off by default): remote CREATE runs an
+            # arbitrary argv as the desktop user, so mint-over-network is a
+            # box-side opt-in. Triggering owner-defined launchers stays open.
+            if path == "/api/launchers":
+                if not ALLOW_APP_LAUNCHERS:
+                    # Windows has no `couchside` CLI (that verb is Linux-only);
+                    # the switch here is the config file the installer writes.
+                    self._send(403, {"ok": False, "error":
+                                     "creating launchers from the app is disabled "
+                                     "on this box. To turn it on, set "
+                                     "\"allow_app_launchers\": true in "
+                                     "%ProgramData%\\Couchside\\config.json and "
+                                     "restart the Couchside agent (tray icon "
+                                     "→ Restart)."}, started)
+                    return
+                self._handle_add_launcher(body, started)
+                return
+
+            lprefix = "/api/launchers/"
+            if path.startswith(lprefix):
+                launcher_id = unquote(path[len(lprefix):])
+                argv = _launcher_argv(launcher_id)
+                if argv is None:
+                    self._send(404, {"ok": False,
+                                     "error": "unknown launcher"}, started)
+                    return
+                result = mock_launch(argv) if self.mock else real_launch(argv)
+                self._send(200, result, started)
+                return
+
+            if path == "/api/update/apply":
+                # App-triggered box-side update. OFF by default: only works when
+                # the owner opted in on THIS box (allow_app_update). Otherwise
+                # 403 so the surface doesn't exist unless enabled.
+                if not ALLOW_APP_UPDATE:
+                    self._send(403, {"ok": False,
+                                     "error": "app-triggered updates disabled "
+                                     "(the PC's owner can enable them by setting "
+                                     "\"allow_app_update\": true in "
+                                     "%ProgramData%\\Couchside\\config.json)"},
+                               started)
+                    return
+                if self.mock:
+                    self._send(200, {"ok": True, "started": True,
+                                     "log": "(mock)"}, started)
+                    return
+                # Request body is ignored on purpose: no URL/args/version from
+                # the network. 409 = refused (unsigned/RC/Python build, or an
+                # update already running); progress via /api/update/check.
+                code, result = update_apply()
+                self._send(code, result, started)
+                return
+
+            # POST /api/tv/volume: absolute volume {"level": 0-100, "target":
+            # "box"|"tv"}. Box converges on the Core Audio endpoint scalar; the
+            # Windows panel has no absolute-set/read frame, so target "tv" 404s
+            # (no backend). Checked before the generic /api/tv/<op> route.
+            if path == "/api/tv/volume":
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(req, dict):
+                        raise ValueError("body must be a JSON object")
+                    lvl = int(req.get("level"))
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "level must be an integer"},
+                               started)
+                    return
+                if not 0 <= lvl <= 100:
+                    self._send(400, {"error": "level must be 0-100"}, started)
+                    return
+                tgt = req.get("target") or "box"
+                if tgt == "tv":
+                    # No Windows TV backend can set an absolute level.
+                    self._send(404, {"error": "no tv volume backend"}, started)
+                    return
+                if not soft_available():
+                    self._send(404, {"error": "no box volume backend"}, started)
+                    return
+                result = ({"ok": True, "exit_code": 0, "level": lvl,
+                           "stdout": "[mock] box volume %d" % lvl,
+                           "stderr": "", "duration_ms": 100}
+                          if self.mock else soft_set_volume(lvl))
+                self._send(200, result, started)
+                return
+
+            # POST /api/media/<player>/<op>: SMTC transport. Checked before the
+            # generic /api/tv/ route (both live under /api/, distinct prefixes).
+            mprefix = "/api/media/"
+            if path.startswith(mprefix):
+                rest = path[len(mprefix):]
+                parts = rest.rsplit("/", 1)
+                if len(parts) != 2 or not parts[0] or not parts[1]:
+                    self._send(404, {"error": "not found"}, started)
+                    return
+                player, op = unquote(parts[0]), parts[1]
+                if op not in SMTC_OPS:
+                    self._send(404, {"error": "unknown media op"}, started)
+                    return
+                result = (mock_smtc_op(player, op) if self.mock
+                          else real_smtc_op(player, op))
+                if result is None:
+                    self._send(404, {"error": "unknown player"}, started)
+                    return
+                self._send(200, result, started)
+                return
+
+            # POST /api/power/sleep: arm a delayed suspend/poweroff.
+            if path == "/api/power/sleep":
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(req, dict):
+                        raise ValueError
+                    delay_s = int(req.get("delay_s"))
+                    action = req.get("action")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400,
+                               {"error": "delay_s (int) and action required"},
+                               started)
+                    return
+                if not SLEEP_MIN_S <= delay_s <= SLEEP_MAX_S:
+                    self._send(400, {"error": "delay_s out of range"}, started)
+                    return
+                ok, err = sleep_can_arm(action)
+                if not ok:
+                    self._send(400, {"error": err}, started)
+                    return
+                self._send(200, {"sleep": sleep_arm(delay_s, action)}, started)
+                return
+
+            # POST /api/power/wake: set a scheduled wake to an absolute time.
+            if path == "/api/power/wake":
+                if not wake_available():
+                    self._send(409, {"error": "no wake backend"}, started)
+                    return
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    at = int(req.get("at"))
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._send(400, {"error": "at (epoch seconds) required"},
+                               started)
+                    return
+                now = time.time()
+                if not now + WAKE_MIN_S <= at <= now + WAKE_MAX_S:
+                    self._send(400, {"error": "at must be %d-%ds out"
+                                     % (WAKE_MIN_S, WAKE_MAX_S)}, started)
+                    return
+                if not wake_set(at):
+                    # 503 not 500: the platform/driver refusing the wake timer is
+                    # a transient/unsupported-backend condition, not an agent bug
+                    # (matches the capture-failed convention elsewhere).
+                    self._send(503, {"error": "wake set failed"}, started)
+                    return
+                self._send(200, {"wake": wake_info()}, started)
+                return
+
+            # POST /api/tv/roku/add: register a Roku by host. Body {"host":
+            # "<ip>"}. Roku needs no pairing — verify it answers ECP, capture its
+            # friendly name, and persist. Returns the name.
+            if path == "/api/tv/roku/add":
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    host = req["host"]
+                    if not isinstance(host, str) or not host:
+                        raise ValueError("host required")
+                except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                    self._send(400, {"error": "host (string) required"}, started)
+                    return
+                if self.mock:
+                    self._send(200, {"ok": True, "added": True, "backend": "roku",
+                                     "host": host, "name": "Mock Roku"}, started)
+                    return
+                try:
+                    name = roku_add(host)
+                except (IOError, OSError) as e:
+                    self._send(502, {"ok": False,
+                                     "error": "not a reachable Roku: %s" % e},
+                               started)
+                    return
+                try:
+                    _roku_save(host, name)
+                except OSError as e:
+                    self._send(500, {"ok": False,
+                                     "error": "could not persist config: %s" % e},
+                               started)
+                    return
+                set_roku(False)
+                set_caps(False)
+                self._send(200, {"ok": True, "added": True, "backend": "roku",
+                                 "host": host, "name": name}, started)
+                return
+
+            # POST /api/tv/key/<k>: factory-remote / nav key. The active backend
+            # selects the key vocabulary + sender (Roku ECP here).
+            keyprefix = "/api/tv/key/"
+            if path.startswith(keyprefix):
+                k = unquote(path[len(keyprefix):])
+                backend = _tv_hw_backend()
+                if backend == "roku" and k in _ROKU_KEYS:
+                    result = (mock_roku("key %s" % k) if self.mock
+                              else real_roku_key(k))
+                else:
+                    self._send(404, {"error": "unknown key"}, started)
+                    return
+                self._send(200, result, started)
+                return
+
+            # POST /api/tv/text: type text into a focused on-TV field. Body
+            # {"text": "..."}. Roku types via ECP Lit_ keypresses (tv_info.text
+            # gates it in the app).
+            if path == "/api/tv/text":
+                backend = _tv_hw_backend()
+                if backend != "roku":
+                    self._send(404, {"error": "no text backend"}, started)
+                    return
+                try:
+                    req = json.loads(body.decode("utf-8")) if body else {}
+                    text = req["text"]
+                    if not isinstance(text, str):
+                        raise ValueError("text must be a string")
+                except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                    self._send(400, {"error": "text must be a string"}, started)
+                    return
+                result = (mock_roku("text") if self.mock
+                          else real_roku_text(text))
+                self._send(200, result, started)
+                return
+
+            tprefix = "/api/tv/"
+            if path.startswith(tprefix):
+                op = path[len(tprefix):]
+                if op not in TV_OPS:
+                    self._send(404, {"error": "unknown tv op"}, started)
+                    return
+                target = parse_qs(parsed.query).get("target", [None])[0]
+                result = tv_send(op, self.mock, target)
+                if result is None:
+                    self._send(404, {"error": "not found"}, started)
+                    return
+                self._send(200, result, started)
+                return
+
+            self._send(404, {"error": "not found"}, started)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            try:
+                self._send(500, {"error": e.__class__.__name__}, started)
+            except Exception:
+                pass
+
+    def do_DELETE(self):
+        started = time.monotonic()
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/")
+
+            if not path.startswith("/api/"):
+                if self._body_too_large():
+                    self.close_connection = True
+                    self._send(413, {"error": "request body too large"}, started)
+                    return
+                self._read_body()  # drain for keep-alive safety
+                self._send(404, {"error": "not found"}, started)
+                return
+
+            # Authorize BEFORE reading the body (see do_POST).
+            if not self._authorized():
+                self.close_connection = True
+                self._send(401, {"error": "unauthorized"}, started)
+                return
+
+            # DELETE bodies are unusual but a client may send one; cap + drain it
+            # for keep-alive safety now that we've authorized.
+            if self._body_too_large():
+                self.close_connection = True
+                self._send(413, {"error": "request body too large"}, started)
+                return
+            self._read_body()
+
+            lprefix = "/api/launchers/"
+            if path.startswith(lprefix):
+                launcher_id = unquote(path[len(lprefix):])
+                if launcher_id.split(":", 1)[0] in _AUTO_LAUNCHER_KINDS:
+                    # steam/epic/gog/xbox are auto-discovered, not stored config.
+                    self._send(400, {"error": "not deletable"}, started)
+                    return
+                if not _valid_launcher_id(launcher_id):
+                    self._send(404, {"error": "unknown launcher"}, started)
+                    return
+                if not delete_launcher(launcher_id):
+                    self._send(404, {"error": "unknown launcher"}, started)
+                    return
+                self._send(200, {"ok": True}, started)
+                return
+
+            # DELETE /api/power/sleep: cancel the armed sleep timer (idempotent).
+            if path == "/api/power/sleep":
+                sleep_cancel()
+                self._send(200, {"sleep": None}, started)
+                return
+            # DELETE /api/power/wake: clear the scheduled wake (idempotent).
+            if path == "/api/power/wake":
+                wake_clear()
+                self._send(200, {"wake": None}, started)
+                return
+
+            self._send(404, {"error": "not found"}, started)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            try:
+                self._send(500, {"error": e.__class__.__name__}, started)
+            except Exception:
+                pass
+
+    def _handle_add_launcher(self, body, started):
+        try:
+            data = json.loads(body.decode("utf-8")) if body else None
+        except (ValueError, UnicodeDecodeError):
+            self._send(400, {"error": "invalid JSON body"}, started)
+            return
+        if not isinstance(data, dict):
+            self._send(400, {"error": "body must be a JSON object"}, started)
+            return
+        try:
+            launcher = add_launcher(data.get("label"), data.get("cmd"))
+        except ConfigError as e:
+            self._send(400, {"error": str(e)}, started)
+            return
+        self._send(200, launcher, started)
+
+    # -- journal ---------------------------------------------------------------
+
+    def _handle_journal(self, parsed, started):
+        qs = parse_qs(parsed.query)
+        unit = qs.get("unit", [""])[0]
+        scope = qs.get("scope", [""])[0]
+        try:
+            lines = int(qs.get("lines", ["100"])[0])
+        except ValueError:
+            lines = 100
+        lines = max(1, min(500, lines))
+
+        if unit not in WATCHLIST_NAMES:
+            self._send(400, {"error": "unit not allowed"}, started)
+            return
+
+        watch_scope = dict(WATCHLIST)[unit]
+        if scope not in ("system", "user"):
+            scope = watch_scope
+
+        if self.mock:
+            log_lines = mock_journal(unit, scope, lines)
+        else:
+            log_lines = real_journal(unit, scope, lines)
+        self._send(200, {"unit": unit, "scope": scope,
+                         "lines": log_lines}, started)
+
+    # -- gamepad websocket -----------------------------------------------------
+
+    def _handle_gamepad_ws(self, parsed, started):
+        # This socket never returns to HTTP keep-alive.
+        self.close_connection = True
+
+        # Auth BEFORE any handshake response: token query param.
+        qs = parse_qs(parsed.query)
+        supplied = qs.get("token", [""])[0]
+        if not supplied or not hmac.compare_digest(supplied, self.token):
+            self._send(401, {"error": "unauthorized"}, started,
+                       extra_headers={"Connection": "close"})
+            return
+
+        try:
+            _session_mode(parsed.query)
+        except ValueError as e:
+            self._send(400, {"error": str(e)}, started,
+                       extra_headers={"Connection": "close"})
+            return
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        if upgrade != "websocket" or not key:
+            self._send(400, {"error": "websocket upgrade required"}, started,
+                       extra_headers={"Connection": "close"})
+            return
+
+        accept = base64.b64encode(
+            hashlib.sha1((key + WS_GUID).encode("ascii")).digest()
+        ).decode("ascii")
+        try:
+            self.connection.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept.encode("ascii") +
+                b"\r\n\r\n")
+        except OSError:
+            return
+        self._log(101, started)
+
+        try:
+            self._gamepad_session()
+        except Exception as e:  # never fall back to HTTP error responses
+            print("[gamepad] session error: %s: %s"
+                  % (e.__class__.__name__, e), flush=True)
+
+    def _gamepad_session(self):
+        global GAMEPAD_HOLDER
+        conn = self.connection
+        q = parse_qs(urlparse(self.path).query)
+        name = (q.get("name", [""])[0] or "A device")[:40]
+        # 'ask' = request control from the holder; anything else (incl. old
+        # clients that send no param) = grab it, the pre-2.9.2 behavior.
+        ask = q.get("handoff", ["takeover"])[0] == "ask"
+        entry = {"conn": conn, "device": None, "mouse": None, "keyboard": None,
+                 "name": name, "mode": _session_mode(urlparse(self.path).query),
+                 "held": False, "requested": False,
+                 "input_err_count": 0, "input_blocked": False,
+                 "slock": threading.Lock()}
+
+        # ---- decide this session's initial role -------------------------------
+        demoted = None      # a holder we bumped (takeover): notify after unlock
+        with GAMEPAD_LOCK:
+            GAMEPAD_SESSIONS.append(entry)
+            holder = GAMEPAD_HOLDER
+            if holder is None:
+                GAMEPAD_HOLDER = entry
+                entry["held"] = True
+                role = "hold"
+            elif ask:
+                entry["requested"] = True
+                role = "wait"
+            else:  # takeover
+                holder["held"] = False
+                demoted = holder
+                _release_devices(demoted)
+                GAMEPAD_HOLDER = entry
+                entry["held"] = True
+                role = "hold"
+
+        if demoted is not None:
+            _wsend_json(demoted, {"t": "released", "by": name})
+        if role == "hold":
+            if not _make_holder(entry, self.mock):
+                # ViGEm failed; drop this session, promote a waiter if any.
+                self._gamepad_cleanup(entry)
+                return
+        else:  # waiting: tell me, and prompt the holder
+            _wsend_json(entry, {"t": "waiting", "holder": holder.get("name")})
+            _wsend_json(holder, {"t": "control_request", "name": name})
+            # Pre-create mouse/keyboard so a grant hands over ready devices
+            # (instant on Windows; input stays gated on entry["held"]).
+            for slot, factory in (
+                    ("mouse", MockMouse if self.mock else WinMouse),
+                    ("keyboard", MockKeyboard if self.mock else WinKeyboard)):
+                if entry.get(slot) is None:
+                    try:
+                        entry[slot] = factory()
+                    except Exception as e:
+                        print("[gamepad] waiter %s pre-create failed: %s"
+                              % (slot, e), flush=True)
+            print("[gamepad] %s waiting (holder %s)"
+                  % (name, holder.get("name")), flush=True)
+
+        # ---- recv loop --------------------------------------------------------
+        try:
+            conn.settimeout(60.0)
+            buf = bytearray()
+            while True:
+                try:
+                    frame = ws_recv_frame(conn, buf)
+                except ValueError as e:
+                    print("[gamepad] protocol violation: %s" % e, flush=True)
+                    _wsend_op(entry, WS_OP_CLOSE)
+                    return
+                if frame is None:  # EOF / timeout / socket error -> dead
+                    return
+                opcode, payload = frame
+                try:
+                    if opcode == WS_OP_CLOSE:
+                        _wsend_op(entry, WS_OP_CLOSE, payload[:2])
+                        return
+                    if opcode == WS_OP_PING:
+                        _wsend_op(entry, WS_OP_PONG, payload)
+                        continue
+                    if opcode != WS_OP_TEXT:
+                        continue  # ignore binary / stray pong
+                    if not self._gamepad_message(conn, entry, payload):
+                        return
+                except OSError:
+                    return
+        finally:
+            self._gamepad_cleanup(entry)
+
+    def _gamepad_cleanup(self, entry):
+        """Remove a dead session; if it held control, promote a waiter (prefer
+        one that requested). Runs from the session's own thread on exit."""
+        global GAMEPAD_HOLDER
+        promote = None
+        with GAMEPAD_LOCK:
+            if entry not in GAMEPAD_SESSIONS:
+                return  # activation failure and recv-finally may both clean up
+            entry["held"] = False
+            _release_devices(entry)
+            was_holder = GAMEPAD_HOLDER is entry
+            if entry in GAMEPAD_SESSIONS:
+                GAMEPAD_SESSIONS.remove(entry)
+            if was_holder:
+                GAMEPAD_HOLDER = None
+                waiters = [s for s in GAMEPAD_SESSIONS]
+                promote = next((s for s in waiters if s.get("requested")), None) \
+                    or (waiters[0] if waiters else None)
+                if promote is not None:
+                    GAMEPAD_HOLDER = promote
+            # Grab refs while we hold the lock so a concurrent promote can't race.
+            devices = [entry.get("mouse"), entry.get("keyboard")]
+            entry["mouse"] = entry["keyboard"] = None
+        for dev in devices:
+            if dev is not None:
+                try:
+                    dev.destroy()
+                except Exception:
+                    pass
+        if promote is not None and not _make_holder(promote, self.mock):
+            # promotion failed (ViGEm gone): leave no holder.
+            with GAMEPAD_LOCK:
+                if GAMEPAD_HOLDER is promote:
+                    GAMEPAD_HOLDER = None
+        if was_holder:
+            print("[gamepad] holder %s disconnected" % entry.get("name"),
+                  flush=True)
+
+    # Message-type prefixes routed to the mouse / keyboard virtual devices.
+    _MOUSE_TYPES = frozenset(("m", "mb", "mw"))
+    _KEYBOARD_TYPES = frozenset(("kt", "k"))
+
+    # Control frames (holder handoff) — handled regardless of hold state.
+    _CONTROL_TYPES = frozenset(("grant", "deny", "request", "force"))
+
+    def _handle_control(self, entry, t):
+        """Holder-handoff control frame. grant/deny come from the HOLDER;
+        request/force come from a WAITER. Returns True (session continues)."""
+        global GAMEPAD_HOLDER
+        demoted = None
+        promote = None
+        notify_holder = None
+        deny = None
+        with GAMEPAD_LOCK:
+            holder = GAMEPAD_HOLDER
+            if entry not in GAMEPAD_SESSIONS:
+                return False
+            if t in ("grant", "deny") and entry is not holder:
+                return True  # only the holder may grant/deny
+            if t == "grant":
+                target = next((s for s in GAMEPAD_SESSIONS
+                               if s.get("requested") and s is not entry), None)
+                if target is not None:
+                    entry["held"] = False
+                    demoted = entry
+                    target["held"] = False  # enabled only after devices are ready
+                    GAMEPAD_HOLDER = target
+                    promote = target
+            elif t == "deny":
+                deny = next((s for s in GAMEPAD_SESSIONS
+                             if s.get("requested") and s is not entry), None)
+                if deny is not None:
+                    deny["requested"] = False
+            elif t == "request":
+                if holder is not None and entry is not holder:
+                    entry["requested"] = True
+                    notify_holder = holder
+            elif t == "force":
+                if holder is not None and entry is not holder:
+                    holder["held"] = False
+                    demoted = holder
+                    entry["held"] = False
+                    GAMEPAD_HOLDER = entry
+                    promote = entry
+            if demoted is not None:
+                _release_devices(demoted)
+        if demoted is not None:
+            _wsend_json(demoted, {"t": "released",
+                                  "by": (promote or {}).get("name")})
+        if promote is not None and not _make_holder(promote, self.mock):
+            # Failed grant must not strand every remaining client as a waiter.
+            # Cleanup is idempotent with the failed peer's receive-finally.
+            with GAMEPAD_LOCK:
+                failed_holder = GAMEPAD_HOLDER is promote
+            if failed_holder:
+                self._gamepad_cleanup(promote)
+        if notify_holder is not None:
+            _wsend_json(notify_holder, {"t": "control_request",
+                                        "name": entry.get("name")})
+        if deny is not None:
+            _wsend_json(deny, {"t": "denied"})
+        return True
+
+    def _gamepad_message(self, conn, entry, payload):
+        """Handle one text frame. Returns False when the session must end.
+
+        Control frames run regardless of hold state; INPUT frames (pad/mouse/
+        keyboard) are dropped unless this session currently holds control, so a
+        connected-but-waiting phone can never move the pointer.
+        """
+        try:
+            msg = json.loads(payload.decode("utf-8"))
+            if not isinstance(msg, dict):
+                raise ValueError("message must be a JSON object")
+        except (ValueError, UnicodeDecodeError):
+            _wsend_json(entry, {"t": "err", "msg": "invalid JSON message"})
+            _wsend_op(entry, WS_OP_CLOSE)
+            return False
+        t = msg.get("t")
+        if t == "ping":
+            _wsend_json(entry, {"t": "pong"})
+            return True
+        if t in self._CONTROL_TYPES:
+            return self._handle_control(entry, t)
+        # Handoff waits for an in-flight emit before releasing devices. This
+        # prevents a late mouse-down from being sent after its release on demote.
+        with GAMEPAD_LOCK:
+            return self._gamepad_input(entry, msg)
+
+    def _gamepad_input(self, entry, msg):
+        # Existing helper callers omit mode. Input-only sessions additionally
+        # check identity, so stale flags cannot revive a disconnected client.
+        if not entry.get("held") or (entry.get("mode") == "input" and
+                                     GAMEPAD_HOLDER is not entry):
+            return True
+
+        # Select decoder, target device slot, and lazy device factory.
+        t = msg.get("t")
+        if t in self._MOUSE_TYPES:
+            decode, slot = mouse_events, "mouse"
+            factory = MockMouse if self.mock else WinMouse
+        elif t in self._KEYBOARD_TYPES:
+            decode, slot = keyboard_events, "keyboard"
+            factory = MockKeyboard if self.mock else WinKeyboard
+        else:
+            if entry.get("mode") == "input":
+                _wsend_json(entry, {"t": "err", "msg": "controller input not allowed in input mode"})
+                _wsend_op(entry, WS_OP_CLOSE)
+                return False
+            decode, slot, factory = gamepad_events, "device", None
+
+        try:
+            events = decode(msg)
+        except ValueError as e:
+            _wsend_json(entry, {"t": "err", "msg": str(e)})
+            _wsend_op(entry, WS_OP_CLOSE)
+            return False
+
+        target = entry.get(slot)
+        if target is None:
+            if factory is None:
+                return True  # gamepad device gone (mid-teardown): drop frame
+            try:
+                target = factory()
+            except Exception as e:
+                print("[gamepad] %s device create failed: %s"
+                      % (slot, e), flush=True)
+                _wsend_json(entry, {"t": "err",
+                                    "msg": "%s unavailable: %s" % (slot, e)})
+                _wsend_op(entry, WS_OP_CLOSE)
+                return False
+            entry[slot] = target
+            print("[gamepad] %s device created (%s)"
+                  % (slot, target.name), flush=True)
+
+        # Silent-drop guard for SendInput-based input (mouse/keyboard): a
+        # disconnected/switched-away session accepts the injection and drops it
+        # with no error, so the cursor freezes unexplained. Surface it as the
+        # same non-fatal "Input paused" state; it resumes on the next successful
+        # emit once the session is active again. The ViGEm gamepad is a driver
+        # device and works regardless of session, so it is NOT gated here.
+        if slot in ("mouse", "keyboard") and not self.mock and not _input_reachable():
+            self._note_input_error(entry, slot,
+                OSError("agent session not active (disconnected or switched away)"))
+            return True
+        if slot in ("mouse", "keyboard") and not self.mock:
+            privilege = _process_privilege()
+            if (not privilege["elevated"] and not privilege["uiaccess"]
+                    and _foreground_is_elevated() is True):
+                # On the physical console SendInput can report success while
+                # UIPI still discards the event. Do not wait for an OSError to
+                # explain this known boundary. Unknown foregrounds retain the
+                # normal injection path; ViGEm and media controls are unchanged.
+                self._note_input_error(entry, slot,
+                    OSError("administrator foreground blocks normal input"))
+                return True
+
+        try:
+            target.emit(events)
+            entry["input_err_count"] = 0
+            if entry.get("input_blocked"):  # was blocked, now working again
+                entry["input_blocked"] = False
+                _wsend_json(entry, {"t": "resumed"})
+        except (OSError, ValueError) as e:
+            # An input-injection failure is NOT fatal to the session. SendInput
+            # is refused whenever the box is on the lock/secure desktop, the
+            # agent is not in the ACTIVE interactive session (session-0, a
+            # disconnected RDP session), or an elevated window is focused
+            # (UIPI) — all transient conditions. Tearing the socket down here
+            # turned every such moment into "the trackpad stopped working" plus
+            # a reconnect storm (one failed move killed the whole pad/mouse/
+            # keyboard session). Instead: swallow it, log rate-limited, keep the
+            # connection alive, and tell the app so it can show a hint.
+            self._note_input_error(
+                entry, "gamepad" if slot == "device" else slot, e)
+        return True
+
+    def _note_input_error(self, entry, kind, exc):
+        """Non-fatal input-injection failure (see _gamepad_message). Keeps the
+        session, logs rate-limited (first failure then <=once/5s so a stuck
+        session can't flood the log /api/journal serves back), and tells the
+        app ONCE on the transition into the blocked state so the Pad tab can
+        surface the relevant Windows input-boundary hint."""
+        now = time.monotonic()
+        n = entry.get("input_err_count", 0) + 1
+        entry["input_err_count"] = n
+        if not entry.get("input_blocked"):
+            entry["input_blocked"] = True
+            _wsend_json(entry, {"t": "blocked",
+                "msg": _input_blocked_message()})
+        last = entry.get("input_err_logged_at", 0.0)
+        if n == 1 or now - last > 5.0:
+            entry["input_err_logged_at"] = now
+            print("[gamepad] %s input blocked (%s) — connection kept alive; "
+                  "resumes when the box's desktop is active and unlocked [x%d]"
+                  % (kind, exc, n), flush=True)
+
+
+def load_token(args):
+    if args.token:
+        return args.token
+    try:
+        with open(args.token_file, encoding="utf-8-sig") as f:
+            token = f.read().strip()
+        if not token:
+            print("error: token file %s is empty" % args.token_file,
+                  file=sys.stderr)
+            sys.exit(1)
+        return token
+    except OSError as e:
+        print("error: cannot read token file %s: %s" % (args.token_file, e),
+              file=sys.stderr)
+        sys.exit(1)
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a hard cap on concurrent connections so a
+    connection flood cannot exhaust threads/FDs. A non-blocking semaphore is
+    acquired before the worker thread is spawned; over the cap the socket is
+    closed and the connection rejected. Released when the request finishes.
+
+    Note: the long-lived /ws/gamepad connection holds a slot for the entire
+    Pad session, so the cap must comfortably exceed a household's phones. TLS
+    handshakes use the same capped workers, with their own short deadline.
+    """
+    request_queue_size = 128
+    _MAX_CONNECTIONS = 128
+    _TLS_HANDSHAKE_TIMEOUT_S = 5.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._conn_sem = threading.BoundedSemaphore(self._MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self._conn_sem.acquire(blocking=False):
+            # Over the concurrency cap: reject rather than pile up threads.
+            try:
+                self.shutdown_request(request)
+            except Exception:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            # No worker owns the slot if thread creation fails. The server's
+            # _handle_request_noblock exception path closes the accepted socket.
+            self._conn_sem.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            if isinstance(request, ssl.SSLSocket):
+                try:
+                    previous_timeout = request.gettimeout()
+                    request.settimeout(self._TLS_HANDSHAKE_TIMEOUT_S)
+                    request.do_handshake()
+                    # Only negotiation gets the short deadline. Handler.setup
+                    # and the WS loops retain their existing read timeouts.
+                    request.settimeout(previous_timeout)
+                except OSError:
+                    # Timeout, malformed TLS or a dropped peer: close quietly,
+                    # without reaching the HTTP handler or flooding the log.
+                    self.shutdown_request(request)
+                    return
+            super().process_request_thread(request, client_address)
+        finally:
+            try:
+                self._conn_sem.release()
+            except ValueError:
+                pass
+
+
+class QuietThreadingHTTPServer(BoundedThreadingHTTPServer):
+    """ThreadingHTTPServer that doesn't dump a traceback when a client drops
+    the connection. The app (and any LAN poller) freely abandons keep-alive
+    sockets between requests, and on Windows that abrupt close surfaces as
+    ConnectionReset/Aborted inside readline BEFORE the request handler runs —
+    too early for do_GET's try/except to catch. Left alone, socketserver's
+    default handle_error prints a full traceback per drop, which both spams
+    the console and pollutes the agent's own log that /api/journal serves
+    back. These disconnects are benign, so swallow exactly them and defer to
+    the default for anything genuinely unexpected."""
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
+# Console input mode bits (Win32). QuickEdit ships ON: a click/drag in the
+# console window (including grabbing its title bar to move or minimize it) enters
+# selection mode and SUSPENDS the process until a key is pressed. This agent logs
+# every request, so it blocks on the next stdout write and the phone's inputs
+# freeze mid-session. Turning QuickEdit off makes a stray click harmless.
+_STD_INPUT_HANDLE_DWORD = 0xFFFFFFF6  # (DWORD)(STD_INPUT_HANDLE = -10)
+_ENABLE_QUICK_EDIT_MODE = 0x0040
+_ENABLE_EXTENDED_FLAGS = 0x0080
+
+
+def _harden_console():
+    """Disable QuickEdit Mode on our own console, if we have one. No-ops when we
+    run windowless (the scheduled task uses pythonw — GetConsoleMode fails on a
+    non-console handle) and on ANY failure: this must never block startup.
+
+    NOTE: this fixes the click/minimize FREEZE, not the close-KILLS-it problem —
+    a foreground console process cannot cleanly survive its window closing. The
+    fix for that is running windowless (the installer's at-logon scheduled task);
+    running the agent by hand in a visible console is a debugging convenience, not
+    the supported mode.
+    """
+    if not IS_WINDOWS or _kernel32 is None:
+        return
+    try:
+        _kernel32.GetStdHandle.restype = ctypes.c_void_p
+        _kernel32.GetStdHandle.argtypes = [ctypes.c_uint32]
+        _kernel32.GetConsoleMode.argtypes = [ctypes.c_void_p,
+                                             ctypes.POINTER(ctypes.c_uint32)]
+        _kernel32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        h = _kernel32.GetStdHandle(_STD_INPUT_HANDLE_DWORD)
+        mode = ctypes.c_uint32()
+        if not h or not _kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+            return  # no real console (windowless / redirected) -> nothing to do
+        new = (mode.value & ~_ENABLE_QUICK_EDIT_MODE) | _ENABLE_EXTENDED_FLAGS
+        _kernel32.SetConsoleMode(h, new)
+    except Exception:
+        pass
+
+
+def main():
+    # FIRST: start the log tee, so even a startup crash lands somewhere readable.
+    # Under pythonw.exe (how the scheduled task runs us) there is no console and
+    # every print() would otherwise be discarded.
+    _log = start_agent_log()
+
+    p = argparse.ArgumentParser(description="Couchside box agent (Windows)")
+    p.add_argument("--port", type=int, default=None,
+                   help="listen port (overrides config; default %d)" % DEFAULT_PORT)
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--config", default=DEFAULT_CONFIG_PATH,
+                   help="path to config.json (default %s)" % DEFAULT_CONFIG_PATH)
+    p.add_argument("--token-file", default=DEFAULT_TOKEN_PATH)
+    p.add_argument("--token", default=None,
+                   help="literal token (overrides --token-file; dev only)")
+    p.add_argument("--mock", action="store_true",
+                   help="serve fake data, never run real commands")
+    p.add_argument('--tls-port', type=int, default=None, help='HTTPS port (default HTTP port + 1)')
+    p.add_argument('--no-tls', action='store_true', help='disable HTTPS; uploads unavailable')
+    p.add_argument('--tls-dir', default=os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'Couchside', 'tls'))
+    args = p.parse_args()
+
+    if not IS_WINDOWS and not args.mock:
+        print("error: real mode requires Windows; use --mock for development",
+              file=sys.stderr)
+        sys.exit(1)
+
+    load_config(args.config)
+    _inject_steam_action(args.mock)
+    set_tv(args.mock)
+    set_screen(args.mock)
+    set_power_schedule(args.mock)
+    set_caps(args.mock)  # after the detectors above; snapshots CAPS
+    if IS_WINDOWS and not args.mock:
+        _harden_console()  # a stray click on the console must not freeze inputs
+        start_load_sampler()
+    port = args.port if args.port is not None else (CONFIG_PORT or DEFAULT_PORT)
+
+    Handler.token = load_token(args)
+    # Remembered so GET /pair can re-read the current token (unless a literal
+    # --token was supplied, in which case there is no file to re-read).
+    Handler.token_file = None if args.token else args.token_file
+    Handler.port = port
+    Handler.mock = args.mock
+
+    server = QuietThreadingHTTPServer((args.host, port), Handler)
+    server.daemon_threads = True
+    tls_server = None
+    if not args.no_tls:
+        try:
+            tls_server = _start_https(args.host, args.tls_port or port + 1, args.tls_dir)
+            print('HTTPS ready on port %d' % TLS_ADVERT['port'], flush=True)
+        except Exception as e:
+            # Legacy control is preserved, but uploads never fall back to HTTP.
+            print('HTTPS unavailable (%s); legacy controls remain, uploads disabled' % type(e).__name__, flush=True)
+    # Box-driven gamepad keepalive: PING idle sockets so their OS auto-PONG keeps
+    # the session alive even while the app's own JS keepalive timer is frozen (iOS).
+    threading.Thread(target=_gamepad_keepalive_loop,
+                     daemon=True, name="gp-keepalive").start()
+    # Foreground-window + caret watcher: pushes {"t":"osk"} on text-field focus
+    # (raises the app's keyboard, parity with the Linux Steam osk signal) and an
+    # additive {"t":"foreground"} frame on app switch. Real Windows only -- the
+    # probes degrade closed off-Windows, but there is nothing to watch in --mock.
+    if IS_WINDOWS and not args.mock:
+        threading.Thread(target=_fg_watch_loop,
+                         daemon=True, name="fg-watch").start()
+    # LAN discovery: answer the app's UDP probe so this box shows up in
+    # "Scan for boxes" as fast as a Linux box does.
+    threading.Thread(target=_udp_discovery_responder, args=(port,),
+                     daemon=True, name="discover").start()
+    mode = "mock" if args.mock else "real"
+    print("%s %s listening on %s:%d (%s mode)" % (
+        APP_NAME, VERSION, args.host, port, mode), flush=True)
+    info = tv_info()
+    print("tv: %s" % ("%s (%s)" % (info["backend"], info["adapter"])
+                      if info else "unavailable"), flush=True)
+    print("pair: http://localhost:%d/pair" % port, flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        if tls_server:
+            tls_server.shutdown()
+            tls_server.server_close()
+
+
+if __name__ == "__main__":
+    main()
