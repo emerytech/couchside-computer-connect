@@ -152,3 +152,7 @@ were tested separately. Windows core tests, DPAPI, JPEG encoding and PIN widget
 checks passed. These results are not public CI or a released binary certification.
 No signed installer, binary release, internet relay, audio/video streaming, or
 unattended login is supplied.
+
+## Code signing policy
+
+Signing is not activated. See [Code signing policy](docs/CODE_SIGNING_POLICY.md) for scope, review roles, project-specific updater attestations and remaining approval gates; [dependency inventory](docs/DEPENDENCIES.md) distinguishes client components from the full agent installer. No Foundation approval is claimed.
