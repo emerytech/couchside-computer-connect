@@ -17,3 +17,4 @@ jobs:
       - run: python tests/test_computer_connect_mouse_widget.py -q
       - run: python tests/test_win_input_only.py -q
       - run: python tests/test_win_https_upload.py -q
+      - run: python tests/test_win_update_apply.py -q

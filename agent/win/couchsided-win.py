@@ -598,10 +598,37 @@ _UPDATE_DL_HOSTS = ("github.com", "objects.githubusercontent.com",
                     "release-assets.githubusercontent.com")
 _UPDATE_MAX_BYTES = 200 * 1024 * 1024
 # Authenticode signer (SignPath Foundation's certificate, used by many OSS
-# projects) -- so the per-release SHA256 and ProductName below are what tie
-# the file to Couchside specifically.
+# projects). A separately pinned project key binds the final installer digest
+# and release identity; PE metadata and a shared certificate are not project identity.
 _UPDATE_SIGNER_RE = re.compile(r'(^|,\s*)CN="?SignPath Foundation"?\s*(,|$)')
 _UPDATE_PRODUCT_NAME = "Couchside"
+_UPDATE_MANIFEST_ASSET = "CouchsideRelease.json"
+_UPDATE_MANIFEST_SIG_ASSET = "CouchsideRelease.json.sig"
+# Public release-verification key only. Private key never belongs in source/CI.
+_UPDATE_RELEASE_PUBLIC_KEY = "1b35e8a458c7dea979dc97df4d03b01e8d4509f8732459c2c19d3d998aae2b54"
+
+
+def _verify_release_manifest(raw, signature, tag, version, digest):
+    """Authenticate exact bytes before parsing; bind project/release/final asset.
+
+    This is additional to Authenticode, URL checks and monotonic stable versions.
+    No network-supplied key, environment override, or unsigned fallback.
+    """
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    if not isinstance(raw, bytes) or len(raw) > 4096 or not isinstance(signature, bytes) or len(signature) > 128:
+        raise ValueError("invalid signed manifest size")
+    try:
+        sig = base64.b64decode(signature.strip(), validate=True)
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(_UPDATE_RELEASE_PUBLIC_KEY)).verify(sig, raw)
+        expected = {"schema": 1, "repository": "emerytech/couchside-windows",
+                    "tag": tag, "version": version, "asset": "CouchsideSetup.exe",
+                    "sha256": digest}
+        # Strict canonical bytes reject duplicate/unknown fields and ambiguity.
+        canonical = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+        if not hmac.compare_digest(raw, canonical):
+            raise ValueError("release identity or installer digest mismatch")
+    except Exception as exc:
+        raise ValueError("Couchside release manifest verification failed") from exc
 _UPDATE_TTL_S = 6 * 3600
 _update_cache = {"at": 0.0, "data": None}
 _update_lock = threading.Lock()
@@ -790,14 +817,14 @@ def _release_candidate(meta, require_assets=True):
     assets = {}
     for asset in meta.get("assets") or []:
         name = asset.get("name")
-        if name not in (_UPDATE_SETUP_ASSET, _UPDATE_SUM_ASSET):
+        if name not in (_UPDATE_SETUP_ASSET, _UPDATE_SUM_ASSET, _UPDATE_MANIFEST_ASSET, _UPDATE_MANIFEST_SIG_ASSET):
             continue
         expected = _UPDATE_ASSET_PREFIX + tag + "/" + name
         if name in assets or asset.get("browser_download_url") != expected:
             raise ValueError("duplicate or unexpected release asset URL")
         assets[name] = expected
-    if len(assets) != 2:
-        raise ValueError("release lacks installer or checksum")
+    if len(assets) != 4:
+        raise ValueError("release lacks installer, checksum or project-signed manifest")
     return latest, assets
 
 
@@ -924,6 +951,9 @@ def _update_apply_worker():
         if not match:
             raise RuntimeError("invalid installer checksum file")
         expected = match.group(1).lower()
+        raw = _fetch_asset(assets[_UPDATE_MANIFEST_ASSET], limit=4096)
+        signature = _fetch_asset(assets[_UPDATE_MANIFEST_SIG_ASSET], limit=128)
+        _verify_release_manifest(raw, signature, tag, latest, expected)
         tmpdir = tempfile.mkdtemp(prefix="couchside-update-")
         setup = os.path.join(tmpdir, _UPDATE_SETUP_ASSET)
         _update_log("downloading %s %s" % (tag, _UPDATE_SETUP_ASSET))

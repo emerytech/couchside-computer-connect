@@ -206,7 +206,11 @@ class ClientTest(unittest.TestCase):
     def test_native_jpeg_encoder_submits_multiline_script(self):
         # Synthetic 2x2 BGR pixels; no screen or personal content is captured.
         bmp=w._bmp_bytes(2,2,bytes([0,0,255,0,255,0,0,0])*2)
-        data=w._bmp_to_jpeg(bmp)
+        # Cold System.Drawing/PowerShell startup on hosted Windows can exceed
+        # the interactive capture budget. Test encoding correctness separately
+        # from scheduling; production keeps its bounded 8s fail-closed timeout.
+        with patch.object(w,'SCREEN_CAPTURE_TIMEOUT_S',30):
+            data=w._bmp_to_jpeg(bmp)
         self.assertIsNotNone(data)
         image=decode_frame(data);self.assertEqual(image.size,(2,2))
 
